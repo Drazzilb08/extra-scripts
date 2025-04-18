@@ -152,8 +152,10 @@ check_config() {
         fi
 
         [ "${debug,,}" == "true" ] && echo "🔄 Response: $response_code"
-        if [ "$response_code" -eq 200 ] && [ "${debug,,}" = "false" ]; then
-            echo "✅ Webhook is valid"
+        if [ "$response_code" -eq 200 ]; then
+            if [[ "${debug,,}" == "true" ]]; then
+                echo "✅ Webhook is valid"
+            fi
         else
             echo "⚠️ Webhook is not valid. Continuing without notifications."
         fi
@@ -184,19 +186,19 @@ verbose_output() {
 
 ## Clean up old backups beyond the retention limit
 cleanup_function() {
+    verbose_output "💣 Cleaning up old backups..."
     destination_dir=$(realpath -s "$destination_dir")
     if [ -d "$destination_dir/Essential" ]; then
-        verbose_output "🧹 Removing old Essential backups (keeping last $keep_essential)..."
+        verbose_output "🧹 Looking for old Essential backups (keeping last $keep_essential)..."
         find "$destination_dir/Essential" -mindepth 1 -maxdepth 1 -type d | sort -r | tail -n +$(( keep_essential + 1 )) | while read -r dir; do
-            verbose_output "🗑 Removing: $dir"
+            verbose_output "🗑  Removing: $dir"
             rm -rf "$dir"
         done
-        verbose_output "✅ Done\n"
     fi
     if [ -d "$destination_dir"/Full ]; then
-        verbose_output "🧹 Removing old Full backups (keeping last $keep_full)..."
+        verbose_output "🧹 Looking for old Full backups (keeping last $keep_full)..."
         find "$destination_dir/Full" -mindepth 1 -maxdepth 1 -type d | sort -r | tail -n +$(( keep_full + 1 )) | while read -r dir; do
-            verbose_output "🗑 Removing: $dir"
+            verbose_output "🗑  Removing: $dir"
             rm -rf "$dir"
         done
         verbose_output "✅ Done\n"
@@ -795,32 +797,34 @@ main() {
     [[ "${unraid_notify,,}" == "true" ]] && unraid_notification
     [[ "${debug,,}" == "true" ]] && debug_output_function
     printf "\n==================== ✅ Backup Summary ====================\n"
-    printf "\e[1;34m%-30s\e[0m %s\n" "🔁 Backup Type:" "$backup_type"
-    printf "\e[1;34m%-30s\e[0m %s\n" "⏱ Runtime:" "$run_output"
-    printf "\e[1;34m%-30s\e[0m %s\n" "📁 Source Directory:" "$source_dir"
-    printf "\e[1;34m%-30s\e[0m %s\n" "💾 Destination Directory:" "$destination_dir"
+    printf "🔁  \e[1;34m%-30s\e[0m %s\n" "Backup Type:" "$backup_type"
+    printf "⏱️   \e[1;34m%-30s\e[0m %s\n" "Runtime:" "$run_output"
+    printf "📁  \e[1;34m%-30s\e[0m %s\n" "Source Directory:" "$source_dir"
+    printf "💾  \e[1;34m%-30s\e[0m %s\n" "Destination Directory:" "$destination_dir"
 
     if [[ "$backup_type" =~ essential|both|essential_no_full ]]; then
-        printf "\e[1;34m%-30s\e[0m %s\n" "🧩 Essential Size:" "$essential_backup_size"
-        printf "\e[1;34m%-30s\e[0m %s\n" "📚 Total Essential Backups:" "$essential_backup_total_size"
+        printf "🧩  \e[1;34m%-30s\e[0m %s\n" "Essential Size:" "$essential_backup_size"
+        printf "📚  \e[1;34m%-30s\e[0m %s\n" "Total Essential Backups:" "$essential_backup_total_size"
     fi
 
     if [[ "$backup_type" =~ full|both ]]; then
-        printf "\e[1;34m%-30s\e[0m %s\n" "🗂 Full Size:" "$full_backup_size"
-        printf "\e[1;34m%-30s\e[0m %s\n" "📦 Total Full Backups:" "$full_backup_total_size"
+        printf "🗂️   \e[1;34m%-30s\e[0m %s\n" "Full Size:" "$full_backup_size"
+        printf "📦  \e[1;34m%-30s\e[0m %s\n" "Total Full Backups:" "$full_backup_total_size"
     fi
 
-    printf "\e[1;34m%-30s\e[0m %s\n" "🗓 Days Since Last Full:" "$days"
+    printf "🗓️   \e[1;34m%-30s\e[0m %s\n" "Days Since Last Full:" "$days"
+
     if [[ "${full_backup,,}" == "false" && "$force_full_backup" -ne 0 ]]; then
         next_full=$(( force_full_backup - days ))
         if (( next_full > 0 )); then
-            printf "\e[1;34m%-30s\e[0m in %s day(s)\n" "📅 Next Full Backup:" "$next_full"
+            printf "📅  \e[1;34m%-30s\e[0m in %s day(s)\n" "Next Full Backup:" "$next_full"
         else
-            printf "\e[1;34m%-30s\e[0m %s\n" "📅 Next Full Backup:" "Today (forced by schedule)"
+            printf "📅  \e[1;34m%-30s\e[0m %s\n" "Next Full Backup:" "Today (forced by schedule)"
         fi
     fi
 
-    printf "\e[1;34m%-30s\e[0m %s\n" "🧪 Dry Run Mode:" "$dry_run"
+    printf "🧪  \e[1;34m%-30s\e[0m %s\n" "Dry Run Mode:" "$dry_run"
+
     [[ "$backup_failed" == "true" ]] && printf "\n\e[1;31m⚠️  Backup verification failed. Please review the logs.\e[0m\n"
     printf "===========================================================\n"
     verbose_output "✅ All Done!"
