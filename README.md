@@ -3,9 +3,11 @@
 A collection of customizable Bash scripts designed to simplify and automate backup tasks for Plex Media Server, general appdata, and specific folders. These scripts are especially useful for Unraid or other home server environments.
 
 ## 📦 Included Scripts
+[Release Notes](release_notes.md)
 
 - `backup_plex.sh`  
   Backs up Plex Media Server data using a provided configuration file.
+
 
 - `backup_appdata.sh`  
   Backs up specified application data folders with flexible config support.
