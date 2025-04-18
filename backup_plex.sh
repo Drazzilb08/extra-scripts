@@ -152,7 +152,7 @@ check_config() {
         fi
 
         [ "${debug,,}" == "true" ] && echo "🔄 Response: $response_code"
-        if [ "$response_code" -eq 200 ] && [ "${debug,,}" = "true" ]; then
+        if [ "$response_code" -eq 200 ] && [ "${debug,,}" = "false" ]; then
             echo "✅ Webhook is valid"
         else
             echo "⚠️ Webhook is not valid. Continuing without notifications."
@@ -794,33 +794,33 @@ main() {
     # Print summary and optionally notify or debug
     [[ "${unraid_notify,,}" == "true" ]] && unraid_notification
     [[ "${debug,,}" == "true" ]] && debug_output_function
-    printf "\n==================== ✅ Backup Summary ===================="
-    printf "\n\e[1;34m%-25s\e[0m %s\n" "🔁 Backup Type:" "$backup_type"
-    printf "\e[1;34m%-25s\e[0m %s\n" "⏱ Runtime:" "$run_output"
-    printf "\e[1;34m%-25s\e[0m %s\n" "📁 Source Directory:" "$source_dir"
-    printf "\e[1;34m%-25s\e[0m %s\n" "💾 Destination Directory:" "$destination_dir"
+    printf "\n==================== ✅ Backup Summary ====================\n"
+    printf "\e[1;34m%-30s\e[0m %s\n" "🔁 Backup Type:" "$backup_type"
+    printf "\e[1;34m%-30s\e[0m %s\n" "⏱ Runtime:" "$run_output"
+    printf "\e[1;34m%-30s\e[0m %s\n" "📁 Source Directory:" "$source_dir"
+    printf "\e[1;34m%-30s\e[0m %s\n" "💾 Destination Directory:" "$destination_dir"
 
     if [[ "$backup_type" =~ essential|both|essential_no_full ]]; then
-        printf "\e[1;34m%-25s\e[0m %s\n" "🧩 Essential Size:" "$essential_backup_size"
-        printf "\e[1;34m%-25s\e[0m %s\n" "📚 Total Essential Backups:" "$essential_backup_total_size"
+        printf "\e[1;34m%-30s\e[0m %s\n" "🧩 Essential Size:" "$essential_backup_size"
+        printf "\e[1;34m%-30s\e[0m %s\n" "📚 Total Essential Backups:" "$essential_backup_total_size"
     fi
 
     if [[ "$backup_type" =~ full|both ]]; then
-        printf "\e[1;34m%-25s\e[0m %s\n" "🗂 Full Size:" "$full_backup_size"
-        printf "\e[1;34m%-25s\e[0m %s\n" "📦 Total Full Backups:" "$full_backup_total_size"
+        printf "\e[1;34m%-30s\e[0m %s\n" "🗂 Full Size:" "$full_backup_size"
+        printf "\e[1;34m%-30s\e[0m %s\n" "📦 Total Full Backups:" "$full_backup_total_size"
     fi
 
-    printf "\e[1;34m%-25s\e[0m %s\n" "🗓 Days Since Last Full:" "$days"
+    printf "\e[1;34m%-30s\e[0m %s\n" "🗓 Days Since Last Full:" "$days"
     if [[ "${full_backup,,}" == "false" && "$force_full_backup" -ne 0 ]]; then
         next_full=$(( force_full_backup - days ))
         if (( next_full > 0 )); then
-            printf "\e[1;34m%-25s\e[0m in %s day(s)\n" "📅 Next Full Backup:" "$next_full"
+            printf "\e[1;34m%-30s\e[0m in %s day(s)\n" "📅 Next Full Backup:" "$next_full"
         else
-            printf "\e[1;34m%-25s\e[0m %s\n" "📅 Next Full Backup:" "Today (forced by schedule)"
+            printf "\e[1;34m%-30s\e[0m %s\n" "📅 Next Full Backup:" "Today (forced by schedule)"
         fi
     fi
-    printf "\e[1;34m%-25s\e[0m %s\n" "🧪 Dry Run Mode:" "$dry_run"
-    printf "\e[1;34m%-25s\e[0m %s\n" "📡 Notifications:" "${webhook:+enabled}${webhook:-disabled}"
+
+    printf "\e[1;34m%-30s\e[0m %s\n" "🧪 Dry Run Mode:" "$dry_run"
     [[ "$backup_failed" == "true" ]] && printf "\n\e[1;31m⚠️  Backup verification failed. Please review the logs.\e[0m\n"
     printf "===========================================================\n"
     verbose_output "✅ All Done!"
