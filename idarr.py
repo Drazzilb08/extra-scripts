@@ -1211,9 +1211,10 @@ def summarize_run(start_time: float, items: List[MediaItem], updated_items: List
 
 def main():
     args = parse_args()
-    if not (args.type or args.year or args.contains):
-        console("❌ --filter requires at least one of --type, --year, or --contains", "RED")
-        exit(1)
+    if args.filter:
+        if not (args.type or args.year or args.contains):
+            console("❌ --filter requires at least one of --type, --year, or --contains", "RED")
+            exit(1)
     load_runtime_config(args)
     if perform_revert_if_requested(args):
         return
