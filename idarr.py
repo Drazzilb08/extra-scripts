@@ -19,6 +19,8 @@ FREQUENCY_DAYS = 30
 version = "1.0.0"
 import sys
 
+# === Rich Table for Summary ===
+
 # Require Python 3.8+
 if sys.version_info < (3, 10):
     print("Python 3.10 or higher is required. Detected version: {}.{}.{}".format(*sys.version_info[:3]))
@@ -29,8 +31,11 @@ try:
     from tqdm import tqdm
     from unidecode import unidecode
     from dotenv import load_dotenv
-except ImportError:
-    print("requirements are not installed. Please install all dependencies with 'pip install -r requirements.txt'.")
+    from rich.console import Console
+    from rich.table import Table
+except ImportError as e:
+    missing = getattr(e, 'name', None) or str(e)
+    print(f"❌ Missing dependency: {missing}. Please install all dependencies with 'pip install -r requirements.txt'.")
     exit(1)
 
 import os
@@ -157,9 +162,10 @@ class MediaItem:
         cached = CACHE.get(cache_key)
         should_skip = not DRY_RUN and cached and is_recent(cached.get("last_checked", ""))
 
-        if not QUIET:
+        # Only print spacing if we're not skipping
+        if not QUIET and not should_skip:
             console("")
-        logger.info("")
+            logger.info("")
         # --- cache check ---
         if should_skip:
             if cached.get("no_result"):
@@ -185,20 +191,20 @@ class MediaItem:
         if hasattr(result, 'id') and result.id != self.tmdb_id:
             if result.id and result.id != self.tmdb_id:
                 if not QUIET:
-                    console(f"⚠️ TMDB ID mismatch: {self.tmdb_id} → {result.id}", "YELLOW")
-                logger.warning(f"⚠️ TMDB ID mismatch: {self.tmdb_id} → {result.id}")
+                    console(f"  ⚠️ TMDB ID mismatch: {self.tmdb_id} → {result.id}", "YELLOW")
+                logger.warning(f"  ⚠️ TMDB ID mismatch: {self.tmdb_id} → {result.id}")
             self.new_tmdb_id = result.id
         if hasattr(result, 'tvdb_id') and result.tvdb_id != self.tvdb_id:
             if getattr(result, 'tvdb_id', None) and result.tvdb_id != self.tvdb_id:
                 if not QUIET:
-                    console(f"⚠️ TVDB ID mismatch: {self.tvdb_id} → {result.tvdb_id}", "YELLOW")
-                logger.warning(f"⚠️ TVDB ID mismatch: {self.tvdb_id} → {result.tvdb_id}")
+                    console(f"  ⚠️ TVDB ID mismatch: {self.tvdb_id} → {result.tvdb_id}", "YELLOW")
+                logger.warning(f"  ⚠️ TVDB ID mismatch: {self.tvdb_id} → {result.tvdb_id}")
             self.new_tvdb_id = result.tvdb_id
         if hasattr(result, 'imdb_id') and result.imdb_id != self.imdb_id:
             if getattr(result, 'imdb_id', None) and result.imdb_id != self.imdb_id:
                 if not QUIET:
-                    console(f"⚠️ IMDB ID mismatch: {self.imdb_id} → {result.imdb_id}", "YELLOW")
-                logger.warning(f"⚠️ IMDB ID mismatch: {self.imdb_id} → {result.imdb_id}")
+                    console(f"  ⚠️ IMDB ID mismatch: {self.imdb_id} → {result.imdb_id}", "YELLOW")
+                logger.warning(f"  ⚠️ IMDB ID mismatch: {self.imdb_id} → {result.imdb_id}")
             self.new_imdb_id = result.imdb_id
         # update title/year if different
         tmdb_title = getattr(result, 'title', getattr(result, 'name', None))
@@ -357,8 +363,10 @@ def generate_new_filename(media_item: 'MediaItem', old_filename: str) -> str:
     )
     # Build ID suffixes
     id_parts = []
-    for attr, prefix in (('new_tmdb_id', 'tmdb'), ('new_tvdb_id', 'tvdb'), ('new_imdb_id', 'imdb')):
-        val = getattr(media_item, attr, None) or getattr(media_item, attr.replace('new_', ''), None)
+    for attr, prefix in (('tmdb_id', 'tmdb'), ('tvdb_id', 'tvdb'), ('imdb_id', 'imdb')):
+        val = getattr(media_item, f"new_{attr}", None)
+        if val is None:
+            val = getattr(media_item, attr, None)
         if val:
             id_parts.append(f"{prefix}-{val}")
     suffix = ''.join(f" {{{part}}}" for part in id_parts)
@@ -949,6 +957,7 @@ def rename_files(items: List[MediaItem]) -> list:
         header_printed = False
         for index, file_path in enumerate(media_item.files):
             directory, old_filename = os.path.split(file_path)
+            # Use generate_new_filename to ensure ID suffixes and updated year/title are preserved
             new_filename = generate_new_filename(media_item, old_filename)
             if old_filename == new_filename:
                 if DEBUG_MODE:
@@ -956,39 +965,14 @@ def rename_files(items: List[MediaItem]) -> list:
                     logger.debug(f"Skipping unchanged file: {old_filename}")
                 skipped += 1
                 continue
-            base_title = media_item.new_title if media_item.new_title is not None else media_item.title
-            base_year  = media_item.new_year   if media_item.new_year   is not None else media_item.year
-            id_suffixes = []
-            tmdb_id = getattr(media_item, 'new_tmdb_id', getattr(media_item, 'tmdb_id', None))
-            tvdb_id = getattr(media_item, 'new_tvdb_id', getattr(media_item, 'tvdb_id', None))
-            imdb_id = getattr(media_item, 'new_imdb_id', getattr(media_item, 'imdb_id', None))
-            if tmdb_id:
-                id_suffixes.append(f"tmdb-{tmdb_id}")
-            if tvdb_id:
-                id_suffixes.append(f"tvdb-{tvdb_id}")
-            if imdb_id:
-                id_suffixes.append(f"imdb-{imdb_id}")
-            suffix = ' ' + ' '.join(f'{{{id_str}}}' for id_str in id_suffixes) if id_suffixes else ''
-            ext = os.path.splitext(old_filename)[-1]
-            season_suffix = ''
-            match = SEASON_PATTERN.search(old_filename)
-            if match:
-                season_suffix = match.group(0)
-            base = f"{base_title}{f' ({base_year})' if base_year else ''}"
-            if media_type == "tv_series":
-                new_filename = f"{base}{suffix}{season_suffix}{ext}"
-            else:
-                new_filename = f"{base}{season_suffix}{suffix}{ext}"
-            new_filename = sanitize_filename(new_filename)
-            new_filename = ' '.join(new_filename.split()).strip()
             if len(new_filename) > 255:
                 console(f"⛔ Skipped (too long): {new_filename}", "RED")
                 logger.warning(f"⛔ Skipped (too long): {new_filename}")
                 skipped += 1
                 continue
             if new_filename.lower() in existing_filenames and old_filename.lower() != new_filename.lower():
-                console(f"⚠️  Skipped (name conflict): {new_filename}", "YELLOW")
-                logger.warning(f"⚠️  Skipped (name conflict): {new_filename}")
+                console(f"  ⚠️  Skipped (name conflict): {new_filename}", "YELLOW")
+                logger.warning(f"  ⚠️  Skipped (name conflict): {new_filename}")
                 skipped += 1
                 continue
             new_path = os.path.join(directory, new_filename)
@@ -996,6 +980,9 @@ def rename_files(items: List[MediaItem]) -> list:
                 continue
             if DRY_RUN:
                 if media_type == "tv_series":
+                    # Determine base title and year for header
+                    base_title = media_item.new_title if media_item.new_title is not None else media_item.title
+                    base_year = media_item.new_year if media_item.new_year is not None else media_item.year
                     # Print series header once
                     if not header_printed:
                         console(f"[DRY RUN] Series: {base_title} ({base_year})")
@@ -1191,17 +1178,35 @@ def summarize_run(start_time: float, items: List[MediaItem], updated_items: List
         mins, secs = divmod(rem, 60)
         elapsed_str = f"{hours}h {mins}m {secs}s"
 
-    summary = (
-        f"\n🏁 Performance Summary:\n"
-        f"\t• Time elapsed: {elapsed_str}\n"
-        f"\t• Items processed: {len(items)}\n"
-        f"\t• Files renamed: {len(file_updates)}\n"
-        f"\t• Unmatched items: {len(UNMATCHED_CASES)}\n"
-        f"\t• TV series missing TVDB: {len(TVDB_MISSING_CASES)}\n"
-        f"\t• Reclassified (movie→TV): {len(RECLASSIFIED)}\n"
+    # Count items skipped due to fresh cache
+    cache_skipped = sum(
+        1
+        for item in items
+        if not DRY_RUN
+        and CACHE.get(f"{item.title} ({item.year}) [{item.type}]")
+        and is_recent(CACHE[f"{item.title} ({item.year}) [{item.type}]"].get("last_checked", ""))
     )
-    print(summary)
-    logger.info(summary)
+
+    labels = [
+        ("⏱️ Elapsed Time", elapsed_str),
+        ("📦 Items Processed", len(items)),
+        ("✏️ Files Renamed", len(file_updates)),
+        ("❌ Unmatched Items", len(UNMATCHED_CASES)),
+        ("📺 TVDB Missing (TV)", len(TVDB_MISSING_CASES)),
+        ("🔁 Reclassified (TV)", len(RECLASSIFIED)),
+        ("💾 Cache Skipped", cache_skipped),
+    ]
+    # Use Rich Table for summary
+    console_rich = Console()
+    table = Table(show_header=False, box=None, padding=(0,1))
+    for label, value in labels:
+        table.add_row(label, str(value))
+    console_rich.rule("[bold]Summary Report")
+    console_rich.print(table)
+    console_rich.rule()
+    logger.info("Summary Report:")
+    for label, value in labels:
+        logger.info(f"{label}: {value}")
     active_keys = {
         f"{item.title} ({item.year}) [{item.type}]"
         for item in updated_items
