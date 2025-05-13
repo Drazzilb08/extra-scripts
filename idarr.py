@@ -1068,25 +1068,39 @@ def parse_args():
         description="Enrich and rename media image files using TMDB metadata.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
+
     parser.add_argument("--version", action="version", version=f"idarr.py {version}")
-    parser.add_argument("--tmdb-api-key", type=str, help="Override the TMDB API key")
-    parser.add_argument("--source", type=str, help="Directory of input image files")
-    parser.add_argument("--dry-run", action="store_true", help="Simulate renaming operations without making changes")
-    parser.add_argument("--quiet", action="store_true", help="Suppress all output except progress bars")
-    parser.add_argument("--log-level", type=str, default="INFO", help="Logging level (e.g., DEBUG, INFO)")
-    parser.add_argument("--frequency-days", type=int, default=30, help="Days before cache entries are considered stale")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging output")
-    parser.add_argument("--limit", type=int, help="Maximum number of items to process")
-    parser.add_argument("--export-csv", action="store_true", help="Export renamed metadata to a CSV file")
-    parser.add_argument("--show-unmatched", action="store_true", help="Print unmatched items even in quiet mode")
-    parser.add_argument("--clear-cache", action="store_true", help="Delete the existing metadata cache before running")
-    parser.add_argument("--cache-path", type=str, help="Specify a custom cache file path")
-    parser.add_argument("--no-cache", action="store_true", help="Skip loading or saving the cache")
-    parser.add_argument("--filter", action="store_true", help="Enable filtering mode (requires one or more of --type, --year, or --contains to be set)")
-    parser.add_argument("--type", choices=["movie", "tv_series", "collection"], help="Only process a specific media type")
-    parser.add_argument("--year", type=int, help="Only process items released in a specific year")
-    parser.add_argument("--contains", type=str, help="Only include titles containing this substring (case-insensitive)")
-    parser.add_argument("--revert", action="store_true", help="Undo renames using the backup file (renamed_backup.json)")
+
+    # --- General Options ---
+    general = parser.add_argument_group("General Options")
+    general.add_argument("--source", metavar="DIR", type=str, help="Directory of input image files")
+    general.add_argument("--tmdb-api-key", metavar="KEY", type=str, help="Override the TMDB API key")
+    general.add_argument("--dry-run", action="store_true", help="Simulate renaming operations without making changes")
+    general.add_argument("--quiet", action="store_true", help="Suppress all output except progress bars")
+    general.add_argument("--log-level", metavar="LEVEL", type=str, default="INFO", help="Logging level (e.g., DEBUG, INFO)")
+    general.add_argument("--debug", action="store_true", help="Enable debug logging output")
+    general.add_argument("--limit", metavar="N", type=int, help="Maximum number of items to process")
+
+    # --- Caching Options ---
+    cache = parser.add_argument_group("Caching Options")
+    cache.add_argument("--frequency-days", metavar="DAYS", type=int, default=30, help="Days before cache entries are considered stale")
+    cache.add_argument("--clear-cache", action="store_true", help="Delete the existing metadata cache before running")
+    cache.add_argument("--cache-path", metavar="PATH", type=str, help="Specify a custom cache file path")
+    cache.add_argument("--no-cache", action="store_true", help="Skip loading or saving the cache")
+
+    # --- Filtering Options ---
+    filtering = parser.add_argument_group("Filtering Options")
+    filtering.add_argument("--filter", action="store_true", help="Enable filtering mode (requires one or more of --type, --year, or --contains)")
+    filtering.add_argument("--type", choices=["movie", "tv_series", "collection"], help="Only process a specific media type")
+    filtering.add_argument("--year", metavar="YEAR", type=int, help="Only process items released in a specific year")
+    filtering.add_argument("--contains", metavar="TEXT", type=str, help="Only include titles containing this substring (case-insensitive)")
+
+    # --- Export & Recovery ---
+    extra = parser.add_argument_group("Export & Recovery")
+    extra.add_argument("--export-csv", action="store_true", help="Export renamed metadata to a CSV file")
+    extra.add_argument("--show-unmatched", action="store_true", help="Print unmatched items even in quiet mode")
+    extra.add_argument("--revert", action="store_true", help="Undo renames using the backup file (renamed_backup.json)")
+
     return parser.parse_args()
 
 def load_runtime_config(args) -> None:
