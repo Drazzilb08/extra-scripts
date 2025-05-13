@@ -758,38 +758,16 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
                 else:
                     console(line, "WHITE")
 
-        # === Step 2: Handle No Results ===
-        # If no results, attempt fallback logic such as type reclassification or alternate search strategies
-        if not search_results:
-            console(f"🚫 No result found for “{search.title}” ({search.year}) [{media_type}]", "RED")
-            logger.warning(f"🚫 No result found for “{search.title}” ({search.year}) [{media_type}]")
-            # Movie-to-TV fallback for single-file items
-            if media_type == "movie" and hasattr(search, "files") and len(search.files) == 1:
-                logger.info(f"🔄 Movie lookup failed; retrying as TV series for single-file “{search.title}”")
-                console(f"🔄 Retrying as TV series: “{search.title}”", "YELLOW")
-                tv_result = query_tmdb(search, "tv_series")
-                if tv_result:
-                    RECLASSIFIED.append({
-                        "original_type": "movie",
-                        "new_type": "tv_series",
-                        "title": search.title,
-                        "year": search.year,
-                        "matched_id": getattr(tv_result, "id", None),
-                        "file": os.path.basename(search.files[0])
-                    })
-                    search.type = "tv_series"
-                    selected_id = getattr(tv_result, "id", None)
-                    return tv_result
-            raise NoResultsError(f"No result found for {search.title} ({search.year}) [{media_type}]")
+        # === Step 2: Match by Known IDs ===
 
-        # === Step 3: Match by Known IDs ===
+        # === Step 2: Match by Known IDs ===
         # Try to match using TMDB, TVDB, or IMDB IDs if present
         id_match = match_by_id(search_results, search, media_type)
         if id_match:
             search.match_reason = "id"
             return id_match
 
-        # === Step 4: Exact Title + Year Match ===
+        # === Step 3: Exact Title + Year Match ===
         # Try for an exact match on normalized title and year
         shortcut = exact_match_shortcut(search_results, search)
         if shortcut:
@@ -803,14 +781,14 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
             search.match_reason = "exact"
             return shortcut
 
-        # === Step 5: Original Title Match ===
+        # === Step 4: Original Title Match ===
         # Try matching on the original (non-localized) title
         orig_match = match_by_original_title(search_results, search, media_type)
         if orig_match:
             search.match_reason = "original"
             return orig_match
 
-        # === Step 6: Alternate Titles / Fuzzy Match ===
+        # === Step 5: Alternate Titles / Fuzzy Match ===
         # Try alternate title match and high-confidence fuzzy matching
         fallback_match = attempt_fallbacks(search_results, search, media_type)
         if fallback_match:
@@ -821,7 +799,7 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
                 search.match_reason = "fuzzy"
             return fallback_match
 
-        # === Step 6b: Fuzzy fallback for collections ===
+        # === Step 5b: Fuzzy fallback for collections ===
         if media_type == "collection":
             candidates, scored = fuzzy_scoring(search_results, search)
             if candidates:
@@ -835,7 +813,7 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
                 search.match_reason = "collection_fuzzy"
                 return best
         
-        # === Step 7: Final Fallback for Single Match ===
+        # === Step 6: Final Fallback for Single Match ===
         # If all else fails, accept a single high-similarity result if no year is specified
         if retry and search.year is None and len(search_results) == 1:
             candidate = search_results[0]
