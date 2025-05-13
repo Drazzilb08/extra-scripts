@@ -842,8 +842,9 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
     except Exception as e:
         console(f"[WARNING] Failed to query TMDB for '{orig_title}' ({search.year}) as {media_type}: {e}", "YELLOW")
         logger.warning(f"Failed to query TMDB for '{orig_title}' ({search.year}) as {media_type}: {e}")
+        # === Step 7: No Results Found ===
         if "No Results Found" in str(e):
-            # 1) Unaccented fallback: try again with unaccented title
+            # === Step 7a: Unaccented Fallback ===
             if not retry_unidecode:
                 unaccented = unidecode(orig_title)
                 if unaccented != orig_title:
@@ -851,21 +852,21 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
                     logger.warning(f"🔁 Retrying with unaccented title: '{unaccented}'")
                     search.title = unaccented
                     return query_tmdb(search, media_type, retry=retry, retry_unidecode=True)
-            # 2) Underscore-to-space fallback: try again with underscores replaced by spaces
+            # === Step 7b: Underscore-to-Space Fallback ===
             if not retry and "_" in orig_title:
                 alt_title = orig_title.replace("_", " ")
                 console(f"[WARNING] 🔁 Retrying TMDB search with out underscores: '{alt_title}'", "YELLOW")
                 logger.warning(f"🔁 Retrying with spaces: '{alt_title}'")
                 search.title = alt_title
                 return query_tmdb(search, media_type, retry=True, retry_unidecode=retry_unidecode)
-            # 3) Hyphen-to-space fallback: try again with hyphens replaced by spaces
+            # === Step 7c: Hyphen-to-Space Fallback ===
             if not retry and "-" in orig_title:
                 alt_title = orig_title.replace("-", " ")
                 console(f"[WARNING] 🔁 Retrying TMDB search without hyphens: '{alt_title}'", "YELLOW")
                 logger.warning(f"🔁 Retrying with spaces: '{alt_title}'")
                 search.title = alt_title
                 return query_tmdb(search, media_type, retry=True, retry_unidecode=retry_unidecode)
-            # 4) Movie-to-TV fallback for single-file items
+            # === Step 7d: Movie-to-TV Fallback ===
             if media_type == "movie" and hasattr(search, "files") and len(search.files) == 1:
                 logger.info(f"🔄 Movie lookup failed; retrying as TV series for single-file “{search.title}”")
                 console(f"🔄 Retrying as TV series: “{search.title}”", "YELLOW")
@@ -882,7 +883,7 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
                     search.type = "tv_series"
                     selected_id = getattr(tv_result, "id", None)
                     return tv_result
-            # 5) Final fallback: try search with no year if all else failed
+            # === Step 7e: Retry with No Year ===
             if media_type in ("movie", "tv_series") and not retry:
                 logger.warning(f"🔁 Final fallback: retrying TMDB search with no year for “{search.title}”")
                 console(f"🔁 Final fallback: retrying TMDB search with no year", "YELLOW")
