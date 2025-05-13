@@ -1,13 +1,17 @@
 # Version 1.0.0
-### === CONFIGURATION === ###
-DRY_RUN = True
-QUIET = False  # Suppress console output and use progress bar instead
-source_dir = "/Users/drazzilb/sandbox/input/test_folder"
-# You can set YOUR_TMDB_API_KEY here, or via the environment variable "TMDB_API_KEY"
+# === Configuration ===
+# Modify these values to control behavior
+# True/False
+DRY_RUN = False
+# True/False | If True, hide console output and show only progress bar
+QUIET = False
+# Directory for your created posters
+SOURCE_DIRECTORY = ""
+# TMDB API Key: Set directly here or via the "TMDB_API_KEY" environment variable
 YOUR_TMDB_API_KEY = ""
+# Options: INFO/DEBUG
 LOG_LEVEL = "INFO"
-
-
+# Frequency that files will be checked against TMDB
 FREQUENCY_DAYS = 30
 
 ### === Do not edit below here === ###
@@ -284,6 +288,7 @@ TVDB_MISSING_CASES: List[Dict[str, Any]] = []
 # Track movie→tv reclassifications
 RECLASSIFIED: List[Dict[str, Any]] = []
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", YOUR_TMDB_API_KEY)
+source_dir = os.environ.get("source_dir", SOURCE_DIRECTORY)
 
 # Create a single TMDb client for reuse
 tmdb_client = TMDbAPIs(TMDB_API_KEY)
