@@ -1,8 +1,8 @@
-# Version 1.0.0
+
 # === Configuration ===
 # Modify these values to control behavior
 # True/False
-DRY_RUN = False
+DRY_RUN = True
 # True/False | If True, hide console output and show only progress bar
 QUIET = False
 # Directory for your created posters
@@ -16,7 +16,7 @@ FREQUENCY_DAYS = 30
 
 ### === Do not edit below here === ###
 
-
+version = "1.0.0"
 import sys
 
 # Require Python 3.8+
@@ -40,6 +40,7 @@ import logging
 import unicodedata
 import string
 import time
+import argparse
 from typing import List, Dict, Pattern, Optional, Tuple, Any
 from pprint import pprint
 from collections import defaultdict
@@ -218,21 +219,6 @@ class MediaItem:
             "year": self.new_year or self.year,
             "title": self.new_title or self.title
         }
-        # Show match result if not QUIET
-        if not QUIET:
-            match_strs = []
-            if self.new_title and self.new_title != self.title:
-                match_strs.append(f"title: {self.title} → {self.new_title}")
-            if self.new_year and self.new_year != self.year:
-                match_strs.append(f"year: {self.year} → {self.new_year}")
-            if self.new_tmdb_id and self.new_tmdb_id != self.tmdb_id:
-                match_strs.append(f"tmdb_id: {self.tmdb_id} → {self.new_tmdb_id}")
-            if self.new_tvdb_id and self.new_tvdb_id != self.tvdb_id:
-                match_strs.append(f"tvdb_id: {self.tvdb_id} → {self.new_tvdb_id}")
-            if self.new_imdb_id and self.new_imdb_id != self.imdb_id:
-                match_strs.append(f"imdb_id: {self.imdb_id} → {self.new_imdb_id}")
-            if match_strs:
-                console("✅ Metadata enriched: " + "; ".join(match_strs), "GREEN")
         return True
 
     def needs_rename(self) -> bool:
@@ -288,7 +274,7 @@ TVDB_MISSING_CASES: List[Dict[str, Any]] = []
 # Track movie→tv reclassifications
 RECLASSIFIED: List[Dict[str, Any]] = []
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", YOUR_TMDB_API_KEY)
-source_dir = os.environ.get("source_dir", SOURCE_DIRECTORY)
+SOURCE_DIR = os.environ.get("SOURCE_DIR", SOURCE_DIRECTORY)
 
 # Create a single TMDb client for reuse
 tmdb_client = TMDbAPIs(TMDB_API_KEY)
@@ -548,17 +534,17 @@ def parse_file_group(folder_path: str, base_name: str, files: List[str]) -> Medi
     return MediaItem(**data)
 
 
-def scan_files_in_flat_folder(source_dir: str) -> List[MediaItem]:
+def scan_files_in_flat_folder(SOURCE_DIR: str) -> List[MediaItem]:
     """
     Scan a flat folder for image assets and group them into MediaItem instances.
     Args:
-        source_dir: Directory to scan.
+        SOURCE_DIR: Directory to scan.
     Returns:
         List of MediaItem instances.
     """
-    logger.info(f"📂 Scanning directory for image assets: {source_dir}")
+    logger.info(f"📂 Scanning directory for image assets: {SOURCE_DIR}")
     try:
-        files = os.listdir(source_dir)
+        files = os.listdir(SOURCE_DIR)
     except FileNotFoundError:
         return []
     groups = defaultdict(list)
@@ -568,7 +554,7 @@ def scan_files_in_flat_folder(source_dir: str) -> List[MediaItem]:
             continue
         ext = os.path.splitext(file)[-1].lower()
         if ext not in IMAGE_EXTENSIONS:
-            full_path = os.path.join(source_dir, file)
+            full_path = os.path.join(SOURCE_DIR, file)
             if DRY_RUN:
                 logger.info(f"[DRY RUN] Would delete non-image file: {file}")
             else:
@@ -584,9 +570,9 @@ def scan_files_in_flat_folder(source_dir: str) -> List[MediaItem]:
     groups = dict(sorted(groups.items(), key=lambda x: x[0].lower()))
     # Flatten all files for progress bar
     all_files = [file for group in groups.values() for file in group if not file.startswith('.')]
-    with tqdm(total=len(all_files), desc=f'Processing files {os.path.basename(source_dir)}', unit='file') as progress:
+    with tqdm(total=len(all_files), desc=f'Processing files {os.path.basename(SOURCE_DIR)}', unit='file') as progress:
         for base_name, files in groups.items():
-            assets_dict.append(parse_file_group(source_dir, base_name, files))
+            assets_dict.append(parse_file_group(SOURCE_DIR, base_name, files))
             progress.update(len(files))
     total_assets = sum(len(v) for v in groups.values())
     logger.info(f"✅ Completed scanning: discovered {len(assets_dict)} asset groups covering {total_assets} files")
@@ -954,7 +940,7 @@ def rename_files(items: List[MediaItem]) -> list:
     logger.info(f"🏷  Starting file rename process ({mode} mode)")
     file_updates = []  # collects tuples of (media_type, old_filename, new_filename)
     renamed, skipped = 0, 0
-    existing_filenames = {f.lower() for f in os.listdir(source_dir)}
+    existing_filenames = {f.lower() for f in os.listdir(SOURCE_DIR)}
     for media_item in items:
         media_type = media_item.type
         if getattr(media_item, "match_failed", False):
@@ -1077,110 +1063,109 @@ def rename_files(items: List[MediaItem]) -> list:
         logger.info(f"📝 Backup of renamed files written to {backup_path}")
     return file_updates
 
-def main():
-    global CACHE
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Enrich and rename media image files using TMDB metadata.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("--version", action="version", version=f"idarr.py {version}")
+    parser.add_argument("--tmdb-api-key", type=str, help="Override the TMDB API key")
+    parser.add_argument("--source", type=str, help="Directory of input image files")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate renaming operations without making changes")
+    parser.add_argument("--quiet", action="store_true", help="Suppress all output except progress bars")
+    parser.add_argument("--log-level", type=str, default="INFO", help="Logging level (e.g., DEBUG, INFO)")
+    parser.add_argument("--frequency-days", type=int, default=30, help="Days before cache entries are considered stale")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging output")
+    parser.add_argument("--limit", type=int, help="Maximum number of items to process")
+    parser.add_argument("--export-csv", action="store_true", help="Export renamed metadata to a CSV file")
+    parser.add_argument("--show-unmatched", action="store_true", help="Print unmatched items even in quiet mode")
+    parser.add_argument("--clear-cache", action="store_true", help="Delete the existing metadata cache before running")
+    parser.add_argument("--cache-path", type=str, help="Specify a custom cache file path")
+    parser.add_argument("--no-cache", action="store_true", help="Skip loading or saving the cache")
+    parser.add_argument("--filter", action="store_true", help="Enable filtering mode (requires one or more of --type, --year, or --contains to be set)")
+    parser.add_argument("--type", choices=["movie", "tv_series", "collection"], help="Only process a specific media type")
+    parser.add_argument("--year", type=int, help="Only process items released in a specific year")
+    parser.add_argument("--contains", type=str, help="Only include titles containing this substring (case-insensitive)")
+    parser.add_argument("--revert", action="store_true", help="Undo renames using the backup file (renamed_backup.json)")
+    return parser.parse_args()
+
+def load_runtime_config(args) -> None:
+    global DRY_RUN, QUIET, SOURCE_DIR, YOUR_TMDB_API_KEY, LOG_LEVEL, FREQUENCY_DAYS, CACHE_PATH, DEBUG_MODE, CACHE
+    DRY_RUN = args.dry_run
+    QUIET = args.quiet
+    SOURCE_DIR = args.source or SOURCE_DIR
+    YOUR_TMDB_API_KEY = args.tmdb_api_key or YOUR_TMDB_API_KEY
+    LOG_LEVEL = args.log_level.upper()
+    FREQUENCY_DAYS = args.frequency_days
+    DEBUG_MODE = args.debug or LOG_LEVEL == "DEBUG"
+    if args.cache_path:
+        CACHE_PATH = args.cache_path
     CACHE = load_cache()
-    start_time = time.time()
-    items = scan_files_in_flat_folder(source_dir)
-    updated_items = handle_data(items)
-    file_updates = rename_files(updated_items)
-    # Export merged metadata+renames CSV in debug mode
-   
+    if args.clear_cache:
+        if os.path.exists(CACHE_PATH):
+            os.remove(CACHE_PATH)
+        CACHE = {}
+
+def perform_revert_if_requested(args) -> bool:
+    if args.revert:
+        revert_path = os.path.join(LOG_DIR, "renamed_backup.json")
+        if os.path.exists(revert_path):
+            with open(revert_path) as f:
+                entries = json.load(f)
+            for entry in entries:
+                old_path = os.path.join(SOURCE_DIR, entry["old"])
+                new_path = os.path.join(SOURCE_DIR, entry["new"])
+                if os.path.exists(new_path):
+                    try:
+                        os.rename(new_path, old_path)
+                        console(f"↩️ Reverted: {entry['new']} → {entry['old']}", "YELLOW")
+                    except Exception as e:
+                        logger.error(f"Failed to revert {entry['new']}: {e}")
+        return True
+    return False
+
+def filter_items(args, items: List[MediaItem]) -> List[MediaItem]:
+    if args.filter:
+        if args.type:
+            items = [i for i in items if i.type == args.type]
+        if args.year:
+            items = [i for i in items if i.year == args.year]
+        if args.contains:
+            items = [i for i in items if args.contains.lower() in i.title.lower()]
+    if args.limit:
+        items = items[:args.limit]
+    return items
+
+def export_csvs(args, updated_items: List[MediaItem], file_updates: list) -> None:
+    if not args.export_csv:
+        return
     csv_path = os.path.join(LOG_DIR, "updated_files.csv")
     with open(csv_path, "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
-        # Header row with metadata + filenames + match_reason
         writer.writerow([
-            "media_type",
-            "original_filename",
-            "new_filename",
-            "original_title",
-            "new_title",
-            "original_year",
-            "new_year",
-            "tmdb_id",
-            "new_tmdb_id",
-            "tvdb_id",
-            "new_tvdb_id",
-            "imdb_id",
-            "new_imdb_id",
+            "media_type", "original_filename", "new_filename",
+            "original_title", "new_title",
+            "original_year", "new_year",
+            "tmdb_id", "new_tmdb_id",
+            "tvdb_id", "new_tvdb_id",
+            "imdb_id", "new_imdb_id",
             "match_reason",
         ])
         for media_type, old_fn, new_fn in file_updates:
-            # Find the matching item in updated_items
-            matched = next(
-                (item for item in updated_items
-                    if item.type == media_type
-                    and any(os.path.basename(fp) == old_fn for fp in item.files)),
-                None
-            )
-            original_title = matched.title if matched else ""
-            new_title = getattr(matched, "new_title", "") if matched else ""
-            original_year = matched.year if matched else ""
-            new_year = getattr(matched, "new_year", "") if matched else ""
-            tmdb_id = matched.tmdb_id if matched else ""
-            new_tmdb_id = getattr(matched, "new_tmdb_id", "") if matched else ""
-            tvdb_id = getattr(matched, "tvdb_id", "") if matched else ""
-            new_tvdb_id = getattr(matched, "new_tvdb_id", "") if matched else ""
-            imdb_id = matched.imdb_id if matched else ""
-            new_imdb_id = getattr(matched, "new_imdb_id", "") if matched else ""
-            match_reason = getattr(matched, "match_reason", "") if matched else ""
+            matched = next((item for item in updated_items if item.type == media_type and any(os.path.basename(fp) == old_fn for fp in item.files)), None)
             writer.writerow([
-                media_type,
-                old_fn,
-                new_fn,
-                original_title,
-                new_title,
-                original_year,
-                new_year,
-                tmdb_id,
-                new_tmdb_id,
-                tvdb_id,
-                new_tvdb_id,
-                imdb_id,
-                new_imdb_id,
-                match_reason,
+                media_type, old_fn, new_fn,
+                getattr(matched, "title", ""), getattr(matched, "new_title", ""),
+                getattr(matched, "year", ""), getattr(matched, "new_year", ""),
+                getattr(matched, "tmdb_id", ""), getattr(matched, "new_tmdb_id", ""),
+                getattr(matched, "tvdb_id", ""), getattr(matched, "new_tvdb_id", ""),
+                getattr(matched, "imdb_id", ""), getattr(matched, "new_imdb_id", ""),
+                getattr(matched, "match_reason", ""),
             ])
     console(f"⚙️ Updated files CSV written to {csv_path}")
     logger.info(f"Updated files CSV written to {csv_path}")
 
-    # Export unmatched cases to CSV
-    if UNMATCHED_CASES:
-        unmatched_csv = os.path.join(LOG_DIR, "unmatched_items.csv")
-        with open(unmatched_csv, "w", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(["#", "media_type", "files", "title", "year", "tmdb_id", "tvdb_id", "imdb_id"])
-            for idx, case in enumerate(UNMATCHED_CASES, 1):
-                writer.writerow([
-                    idx,
-                    case["media_type"],
-                    os.path.basename(case["files"]) if isinstance(case["files"], str) else ";".join(os.path.basename(f) for f in case["files"].split(";")),
-                    case["title"],
-                    case["year"],
-                    case["tmdb_id"],
-                    case["tvdb_id"],
-                    case["imdb_id"],
-                ])
-        console(f"⚠️ Unmatched items written to {unmatched_csv}")
-        logger.info(f"Unmatched items written to {unmatched_csv}")
-
-    # Export TV series missing TVDB mapping
-    if TVDB_MISSING_CASES:
-        tvdb_csv = os.path.join(LOG_DIR, "missing_tvdb.csv")
-        with open(tvdb_csv, "w", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(["title", "year", "tmdb_id", "imdb_id", "files"])
-            for case in TVDB_MISSING_CASES:
-                writer.writerow([
-                    case["title"],
-                    case["year"],
-                    case["tmdb_id"],
-                    case["imdb_id"],
-                    ";".join(os.path.basename(f) for f in case["files"].split(";")) if isinstance(case["files"], str) else ""
-                ])
-        console(f"⚠️ TV series missing TVDB IDs written to {tvdb_csv}")
-        logger.warning(f"TV series missing TVDB IDs written to {tvdb_csv}")
-    # Performance summary
+def summarize_run(start_time: float, items: List[MediaItem], updated_items: List[MediaItem], file_updates: list) -> None:
     elapsed_seconds = int(time.time() - start_time)
     if elapsed_seconds < 60:
         elapsed_str = f"{elapsed_seconds}s"
@@ -1191,29 +1176,40 @@ def main():
         hours, rem = divmod(elapsed_seconds, 3600)
         mins, secs = divmod(rem, 60)
         elapsed_str = f"{hours}h {mins}m {secs}s"
-    total_items = len(items)
-    total_unmatched = len(UNMATCHED_CASES)
-    total_missing_tvdb = len(TVDB_MISSING_CASES)
-    total_reclassified = len(RECLASSIFIED)
-    total_renames = len(file_updates)
 
     summary = (
         f"\n🏁 Performance Summary:\n"
-        f"\t• Time elapsed: {elapsed_str}s\n"
-        f"\t• Items processed: {total_items}\n"
-        f"\t• Files renamed: {total_renames}\n"
-        f"\t• Unmatched items: {total_unmatched}\n"
-        f"\t• TV series missing TVDB: {total_missing_tvdb}\n"
-        f"\t• Reclassified (movie→TV): {total_reclassified}\n"
+        f"\t• Time elapsed: {elapsed_str}\n"
+        f"\t• Items processed: {len(items)}\n"
+        f"\t• Files renamed: {len(file_updates)}\n"
+        f"\t• Unmatched items: {len(UNMATCHED_CASES)}\n"
+        f"\t• TV series missing TVDB: {len(TVDB_MISSING_CASES)}\n"
+        f"\t• Reclassified (movie→TV): {len(RECLASSIFIED)}\n"
     )
     print(summary)
     logger.info(summary)
-    # Construct active_keys set of cache keys for items that still exist
     active_keys = {
         f"{item.title} ({item.year}) [{item.type}]"
         for item in updated_items
     }
     save_cache(CACHE, active_keys)
+
+
+def main():
+    args = parse_args()
+    if not (args.type or args.year or args.contains):
+        console("❌ --filter requires at least one of --type, --year, or --contains", "RED")
+        exit(1)
+    load_runtime_config(args)
+    if perform_revert_if_requested(args):
+        return
+    start_time = time.time()
+    items = scan_files_in_flat_folder(SOURCE_DIR)
+    items = filter_items(args, items)
+    updated_items = handle_data(items)
+    file_updates = rename_files(updated_items)
+    export_csvs(args, updated_items, file_updates)
+    summarize_run(start_time, items, updated_items, file_updates)
 
 
 if __name__ == "__main__":
