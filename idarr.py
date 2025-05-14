@@ -2,7 +2,7 @@
 # === Configuration ===
 # Modify these values to control behavior
 # True/False
-DRY_RUN = True
+DRY_RUN = False
 # True/False | If True, hide console output and show only progress bar
 QUIET = False
 # Directory for your created posters
@@ -264,8 +264,6 @@ def sleep_and_notify(func):
                 time.sleep(e.period_remaining)
     return wrapper
 
-dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-load_dotenv(dotenv_path)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 YEAR_REGEX: Pattern = re.compile(r"\s?\((\d{4})\)(?!.*Collection).*")
 SEASON_PATTERN: Pattern = re.compile(
@@ -279,11 +277,12 @@ UNMATCHED_CASES: List[Dict[str, Any]] = []
 TVDB_MISSING_CASES: List[Dict[str, Any]] = []
 # Track movie→tv reclassifications
 RECLASSIFIED: List[Dict[str, Any]] = []
-TMDB_API_KEY = os.environ.get("TMDB_API_KEY", YOUR_TMDB_API_KEY)
-SOURCE_DIR = os.environ.get("SOURCE_DIR", SOURCE_DIRECTORY)
+# TMDB_API_KEY and SOURCE_DIR will be loaded in load_runtime_config
+TMDB_API_KEY = None
+SOURCE_DIR = None
 
-# Create a single TMDb client for reuse
-tmdb_client = TMDbAPIs(TMDB_API_KEY)
+# Create a single TMDb client for reuse (will be initialized in load_runtime_config)
+tmdb_client = None
 
 # DEBUG_MODE flag: True if LOG_LEVEL is DEBUG
 DEBUG_MODE = LOG_LEVEL.upper() == "DEBUG"
@@ -889,7 +888,7 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
                 search.year = None
                 return query_tmdb(search, media_type, retry=True, retry_unidecode=retry_unidecode)
 
-def handle_data(items: List[MediaItem]) -> List[MediaItem]:
+def handle_data(args, items: List[MediaItem]) -> List[MediaItem]:
     """
     Enrich a list of MediaItem objects with metadata from TMDB.
     Updates UNMATCHED_CASES and TVDB_MISSING_CASES as needed.
@@ -929,6 +928,10 @@ def handle_data(items: List[MediaItem]) -> List[MediaItem]:
                     "imdb_id": getattr(item, "imdb_id", ""),
                     "files": ";".join(item.files)
                 })
+    if QUIET and args.show_unmatched and UNMATCHED_CASES:
+        for case in UNMATCHED_CASES:
+            title = case.get("title", "Unknown")
+            console(f"❌ Unmatched: {title}", "YELLOW")
     if QUIET and progress is not None:
         progress.close()
     print("✅ Completed metadata enrichment")
@@ -949,6 +952,9 @@ def rename_files(items: List[MediaItem]) -> list:
     file_updates = []  # collects tuples of (media_type, old_filename, new_filename)
     renamed, skipped = 0, 0
     existing_filenames = {f.lower() for f in os.listdir(SOURCE_DIR)}
+    if file_updates or DEBUG_MODE:
+        console(f"📂 Renaming files:")
+        logger.info(f"📂 Renaming files:")
     for media_item in items:
         media_type = media_item.type
         if getattr(media_item, "match_failed", False):
@@ -1024,9 +1030,6 @@ def rename_files(items: List[MediaItem]) -> list:
                     logger.error(f"❌ Failed to rename {old_filename}: {e}")
                     skipped += 1
     # Print renaming header if any files were renamed or debug mode is on
-    if file_updates or DEBUG_MODE:
-        console(f"📂 Renaming files:")
-        logger.info(f"📂 Renaming files:")
     if DRY_RUN:
         logger.info("")
         logger.info("📋 Rename Summary:")
@@ -1081,6 +1084,7 @@ def parse_args():
     filtering.add_argument("--type", choices=["movie", "tv_series", "collection"], help="Only process a specific media type")
     filtering.add_argument("--year", metavar="YEAR", type=int, help="Only process items released in a specific year")
     filtering.add_argument("--contains", metavar="TEXT", type=str, help="Only include titles containing this substring (case-insensitive)")
+    filtering.add_argument("--id", metavar="ID", type=str, help="Only include items with a specific ID (tmdb-123, tvdb-456, imdb-tt1234567)")
 
     # --- Export & Recovery ---
     extra = parser.add_argument_group("Export & Recovery")
@@ -1091,37 +1095,82 @@ def parse_args():
     return parser.parse_args()
 
 def load_runtime_config(args) -> None:
-    global DRY_RUN, QUIET, SOURCE_DIR, YOUR_TMDB_API_KEY, LOG_LEVEL, FREQUENCY_DAYS, CACHE_PATH, DEBUG_MODE, CACHE
+    global DRY_RUN, QUIET, SOURCE_DIR, YOUR_TMDB_API_KEY, LOG_LEVEL, FREQUENCY_DAYS, CACHE_PATH, DEBUG_MODE, CACHE, TMDB_API_KEY, tmdb_client
+    # Force reloading of .env to ensure latest changes are read
+    dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    load_dotenv(dotenv_path, override=True)
+
     DRY_RUN = args.dry_run
     QUIET = args.quiet
-    SOURCE_DIR = args.source or SOURCE_DIR
-    YOUR_TMDB_API_KEY = args.tmdb_api_key or YOUR_TMDB_API_KEY
+    # Resolve environment variables after loading .env
+    SOURCE_DIR = os.environ.get("SOURCE_DIR", SOURCE_DIRECTORY)
+    if args.source:
+        SOURCE_DIR = args.source
+    YOUR_TMDB_API_KEY = os.environ.get("TMDB_API_KEY", YOUR_TMDB_API_KEY)
+    if args.tmdb_api_key:
+        YOUR_TMDB_API_KEY = args.tmdb_api_key
+    TMDB_API_KEY = YOUR_TMDB_API_KEY
     LOG_LEVEL = args.log_level.upper()
     FREQUENCY_DAYS = args.frequency_days
     DEBUG_MODE = args.debug or LOG_LEVEL == "DEBUG"
     if args.cache_path:
         CACHE_PATH = args.cache_path
-    CACHE = load_cache()
+    if args.no_cache:
+        CACHE = {}
+    else:
+        CACHE = load_cache()
     if args.clear_cache:
         if os.path.exists(CACHE_PATH):
             os.remove(CACHE_PATH)
         CACHE = {}
+    # Create a single TMDb client for reuse
+    tmdb_client = TMDbAPIs(TMDB_API_KEY)
+def print_settings():
+    """
+    Print current runtime settings for debugging and transparency.
+    """
+    settings = {
+        "SOURCE_DIR": SOURCE_DIR,
+        "TMDB_API_KEY": "********" if TMDB_API_KEY else None,
+        "DRY_RUN": DRY_RUN,
+        "QUIET": QUIET,
+        "LOG_LEVEL": LOG_LEVEL,
+        "FREQUENCY_DAYS": FREQUENCY_DAYS,
+        "CACHE_PATH": CACHE_PATH,
+        "DEBUG_MODE": DEBUG_MODE,
+    }
+    console("🔧 Current Settings", "BLUE")
+    for key, value in settings.items():
+        print(f"{key}: {value}")
 
-def perform_revert_if_requested(args) -> bool:
+def perform_revert_if_requested(args, items: List[MediaItem]) -> bool:
     if args.revert:
         revert_path = os.path.join(LOG_DIR, "renamed_backup.json")
-        if os.path.exists(revert_path):
-            with open(revert_path) as f:
-                entries = json.load(f)
-            for entry in entries:
-                old_path = os.path.join(SOURCE_DIR, entry["old"])
-                new_path = os.path.join(SOURCE_DIR, entry["new"])
-                if os.path.exists(new_path):
-                    try:
-                        os.rename(new_path, old_path)
-                        console(f"↩️ Reverted: {entry['new']} → {entry['old']}", "YELLOW")
-                    except Exception as e:
-                        logger.error(f"Failed to revert {entry['new']}: {e}")
+        if not os.path.exists(revert_path):
+            return True
+
+        with open(revert_path) as f:
+            entries = json.load(f)
+
+        # Map old filenames to MediaItems for filtering
+        filtered_filenames = {
+            os.path.basename(fp)
+            for item in items
+            for fp in item.files
+        }
+
+        for entry in entries:
+            if entry["new"] not in filtered_filenames:
+                continue  # skip entries that don’t match filtered set
+
+            old_path = os.path.join(SOURCE_DIR, entry["old"])
+            new_path = os.path.join(SOURCE_DIR, entry["new"])
+            if os.path.exists(new_path):
+                try:
+                    os.rename(new_path, old_path)
+                    console(f"↩️ Reverted: {entry['new']} → {entry['old']}", "YELLOW")
+                except Exception as e:
+                    logger.error(f"Failed to revert {entry['new']}: {e}")
         return True
     return False
 
@@ -1133,6 +1182,18 @@ def filter_items(args, items: List[MediaItem]) -> List[MediaItem]:
             items = [i for i in items if i.year == args.year]
         if args.contains:
             items = [i for i in items if args.contains.lower() in i.title.lower()]
+        if args.id:
+            prefix = args.id.lower().split('-')[0]
+            id_value = args.id[len(prefix)+1:]
+            if prefix == "tmdb":
+                items = [i for i in items if str(i.tmdb_id) == id_value]
+            elif prefix == "tvdb":
+                items = [i for i in items if str(i.tvdb_id) == id_value]
+            elif prefix == "imdb":
+                items = [i for i in items if str(i.imdb_id) == id_value]
+            else:
+                console(f"❌ Invalid --id format. Use tmdb-123, tvdb-456, or imdb-tt1234567", "RED")
+                exit(1)
     if args.limit:
         items = items[:args.limit]
     return items
@@ -1166,7 +1227,7 @@ def export_csvs(args, updated_items: List[MediaItem], file_updates: list) -> Non
     console(f"⚙️ Updated files CSV written to {csv_path}")
     logger.info(f"Updated files CSV written to {csv_path}")
 
-def summarize_run(start_time: float, items: List[MediaItem], updated_items: List[MediaItem], file_updates: list) -> None:
+def summarize_run(start_time: float, items: List[MediaItem], updated_items: List[MediaItem], file_updates: list, args) -> None:
     elapsed_seconds = int(time.time() - start_time)
     if elapsed_seconds < 60:
         elapsed_str = f"{elapsed_seconds}s"
@@ -1211,8 +1272,8 @@ def summarize_run(start_time: float, items: List[MediaItem], updated_items: List
         f"{item.title} ({item.year}) [{item.type}]"
         for item in updated_items
     }
-    save_cache(CACHE, active_keys)
-
+    if not args.no_cache:
+        save_cache(CACHE, active_keys)
 
 def main():
     args = parse_args()
@@ -1221,16 +1282,22 @@ def main():
             console("❌ --filter requires at least one of --type, --year, or --contains", "RED")
             exit(1)
     load_runtime_config(args)
-    if perform_revert_if_requested(args):
+    if DEBUG_MODE:
+        print_settings()
+    if args.revert:
+        items = scan_files_in_flat_folder(SOURCE_DIR)
+        items = filter_items(args, items)
+        perform_revert_if_requested(args, items)
         return
     start_time = time.time()
     items = scan_files_in_flat_folder(SOURCE_DIR)
     items = filter_items(args, items)
-    updated_items = handle_data(items)
+    updated_items = handle_data(args, items)
+    # from pprint import pprint
+    # pprint([item.__dict__ for item in updated_items])
     file_updates = rename_files(updated_items)
     export_csvs(args, updated_items, file_updates)
-    summarize_run(start_time, items, updated_items, file_updates)
-
+    summarize_run(start_time, items, updated_items, file_updates, args)
 
 if __name__ == "__main__":
     main()
