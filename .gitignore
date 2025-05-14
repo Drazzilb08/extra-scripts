@@ -1,2 +1,8 @@
 backup_plex.conf
 test*
+/.venv
+/logs
+.env
+.DS_Store
+/.archives
+/cache

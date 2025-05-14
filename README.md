@@ -8,12 +8,16 @@ A collection of customizable Bash scripts designed to simplify and automate back
 - `backup_plex.sh`  
   Backs up Plex Media Server data using a provided configuration file.
 
-
 - `backup_appdata.sh`  
   Backs up specified application data folders with flexible config support.
 
 - `backup_folder.sh`  
   Generic backup script for any folder you want to protect.
+
+## 🐍 Python Scripts
+
+- `idarr.py`  
+  Intelligent metadata enrichment and renaming tool for media poster files. Automatically queries TMDB and renames assets with consistent identifiers (TMDB, TVDB, IMDB) based on detected patterns.
 
 ## 🧩 Config Files
 
