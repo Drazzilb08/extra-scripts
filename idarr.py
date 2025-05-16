@@ -47,14 +47,11 @@ import string
 import time
 import argparse
 from typing import List, Dict, Pattern, Optional, Tuple, Any
-from pprint import pprint
 from collections import defaultdict
 from difflib import SequenceMatcher
 from functools import wraps
 import json
 from datetime import datetime, timedelta
-
-from concurrent.futures import ThreadPoolExecutor
 
 # === Cache utilities ===
 CACHE_PATH = os.path.expanduser("~/.cache/idarr_cache.json")
@@ -826,6 +823,23 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
                 search.match_reason = "fallback_single"
                 return candidate
 
+        # === Step 7d-alt: Movie-to-TV fallback if search returned results but no confident match ===
+        if media_type == "movie":
+            logger.info(f"🔄 No confident match as movie; retrying as TV series for “{search.title}”")
+            console(f"🔄 Retrying as TV series: “{search.title}”", "YELLOW")
+            tv_result = query_tmdb(search, "tv_series", retry=retry, retry_unidecode=retry_unidecode)
+            if tv_result:
+                RECLASSIFIED.append({
+                    "original_type": "movie",
+                    "new_type": "tv_series",
+                    "title": search.title,
+                    "year": search.year,
+                    "matched_id": getattr(tv_result, "id", None),
+                    "file": os.path.basename(search.files[0]) if hasattr(search, "files") and search.files else None
+                })
+                search.type = "tv_series"
+                selected_id = getattr(tv_result, "id", None)
+                return tv_result
         # If no confident match found after all strategies
         msg = f"🤷 No confident match found for “{search.title}” ({search.year})"
         logger.warning(msg)
