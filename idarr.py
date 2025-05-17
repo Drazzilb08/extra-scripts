@@ -16,7 +16,7 @@ FREQUENCY_DAYS = 30
 
 ### === Do not edit below here === ###
 
-version = "1.0.0"
+version = "1.1.0"
 import sys
 
 # === Rich Table for Summary ===
@@ -724,6 +724,27 @@ def attempt_fallbacks(search_results: List[Any], search: MediaItem, media_type: 
         return high
     return None
 
+def fetch_by_tmdb_id(search: 'MediaItem', media_type: str) -> Optional[Any]:
+    """
+    Attempt to fetch media details directly using a known TMDB ID.
+    Returns the matching TMDB item if found, or None on failure.
+    """
+    try:
+        logger.info(f"🔍 Step 1: Fetching TMDB {media_type} by TMDB ID {search.tmdb_id}")
+        console(f"🔍 Step 1: Using TMDB ID: {search.tmdb_id}", "BLUE")
+        if media_type == "movie":
+            return tmdb_client._api.movies_get_details(search.tmdb_id)
+        elif media_type == "tv_series":
+            return tmdb_client._api.tv_get_details(search.tmdb_id)
+        elif media_type == "collection":
+            return tmdb_client._api.collections_get_details(search.tmdb_id)
+    except Exception as e:
+        logger.warning(f"❌ TMDB {media_type} lookup failed for ID {search.tmdb_id}: {e}")
+        console(f"❌ TMDB ID lookup failed for {media_type} {search.tmdb_id}: {e}", "RED")
+    logger.info(f"🔁 Falling back to title search for “{search.title}”")
+    console(f"🔁 Falling back to title search", "YELLOW")
+    return None
+
 @sleep_and_notify
 @limits(calls=38, period=10)
 def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unidecode: bool = False) -> Optional[Any]:
@@ -740,20 +761,9 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
         # === Step 1a: Lookup by TMDB ID (Direct Detail Fetch) ===
         search_results = None
         if getattr(search, "tmdb_id", None):
-            logger.info(f"🔍 Step 1: Fetching TMDB {media_type} by TMDB ID {search.tmdb_id}")
-            console(f"🔍 Step 1: Using TMDB ID: {search.tmdb_id}", "BLUE")
-            try:
-                if media_type == "movie":
-                    return tmdb_client._api.movies_get_details(search.tmdb_id)
-                elif media_type == "tv_series":
-                    return tmdb_client._api.tv_get_details(search.tmdb_id)
-                elif media_type == "collection":
-                    return tmdb_client._api.collections_get_details(search.tmdb_id)
-            except Exception as e:
-                logger.warning(f"❌ TMDB {media_type} lookup failed for ID {search.tmdb_id}: {e}")
-                console(f"❌ TMDB ID lookup failed for {media_type} {search.tmdb_id}: {e}", "RED")
-            logger.info(f"🔁 Falling back to title search for “{search.title}”")
-            console(f"🔁 Falling back to title search", "YELLOW")
+            result = fetch_by_tmdb_id(search, media_type)
+            if result:
+                return result
 
         # === Step 1b: Lookup by TMDB Title/Year ===
         search_results = perform_tmdb_search(search, media_type)
