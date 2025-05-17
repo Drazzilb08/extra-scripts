@@ -753,7 +753,22 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
                 else:
                     console(line, "WHITE")
 
-        # === Step 2: Match by Known IDs ===
+        # === Step 1a: If results reply with same title and same year===
+        # Check for ambiguous results: same title and year across multiple results
+        norm_target = normalize_with_aliases(search.title)
+        same_title_year = []
+        for res in search_results:
+            title = getattr(res, 'title', getattr(res, 'name', ''))
+            norm_res_title = normalize_with_aliases(title)
+            date = getattr(res, 'release_date', getattr(res, 'first_air_date', ''))
+            year_val = date.year if hasattr(date, 'year') else (int(date[:4]) if isinstance(date, str) and date[:4].isdigit() else None)
+            if norm_res_title == norm_target and year_val == search.year:
+                same_title_year.append(res)
+
+        if len(same_title_year) > 1:
+            logger.warning(f"⚠️ Ambiguous results: Multiple results found with the same title and year for “{search.title}” ({search.year})")
+            console(f"⚠️ Ambiguous results for “{search.title}” ({search.year}) — skipping match", "YELLOW")
+            return None
 
         # === Step 2: Match by Known IDs ===
         # Try to match using TMDB, TVDB, or IMDB IDs if present
