@@ -737,11 +737,28 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
         logger.info(f"🔍 Searching TMDB for “{search.title}” ({search.year}) [{media_type}]...")
         console(f"🔍 Searching TMDB for “{search.title}” ({search.year}) [{media_type}]...")
 
-        # === Step 1: Search TMDB ===
-        # Perform search by media type (movie, tv_series, collection, etc.)
+        # === Step 1a: Lookup by TMDB ID (Direct Detail Fetch) ===
+        search_results = None
+        if getattr(search, "tmdb_id", None):
+            logger.info(f"🔍 Step 1: Fetching TMDB {media_type} by TMDB ID {search.tmdb_id}")
+            console(f"🔍 Step 1: Using TMDB ID: {search.tmdb_id}", "BLUE")
+            try:
+                if media_type == "movie":
+                    return tmdb_client._api.movies_get_details(search.tmdb_id)
+                elif media_type == "tv_series":
+                    return tmdb_client._api.tv_get_details(search.tmdb_id)
+                elif media_type == "collection":
+                    return tmdb_client._api.collections_get_details(search.tmdb_id)
+            except Exception as e:
+                logger.warning(f"❌ TMDB {media_type} lookup failed for ID {search.tmdb_id}: {e}")
+                console(f"❌ TMDB ID lookup failed for {media_type} {search.tmdb_id}: {e}", "RED")
+            logger.info(f"🔁 Falling back to title search for “{search.title}”")
+            console(f"🔁 Falling back to title search", "YELLOW")
+
+        # === Step 1b: Lookup by TMDB Title/Year ===
         search_results = perform_tmdb_search(search, media_type)
-        if search_results is None:
-            return None
+        if not search_results:
+            search_results = []
 
         # Debug output for search results (if enabled)
         if DEBUG_MODE and search_results:
@@ -756,7 +773,7 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
                 else:
                     console(line, "WHITE")
 
-        # === Step 1a: If results reply with same title and same year===
+        # === Step 2: Disambiguate by Title + Year Match ===
         # Check for ambiguous results: same title and year across multiple results
         norm_target = normalize_with_aliases(search.title)
         same_title_year = []
@@ -773,14 +790,14 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
             console(f"⚠️ Ambiguous results for “{search.title}” ({search.year}) — skipping match", "YELLOW")
             return None
 
-        # === Step 2: Match by Known IDs ===
+        # === Step 3: Match by Known IDs ===
         # Try to match using TMDB, TVDB, or IMDB IDs if present
         id_match = match_by_id(search_results, search, media_type)
         if id_match:
             search.match_reason = "id"
             return id_match
 
-        # === Step 3: Exact Title + Year Match ===
+        # === Step 4: Exact Title + Year Match ===
         # Try for an exact match on normalized title and year
         shortcut = exact_match_shortcut(search_results, search)
         if shortcut:
@@ -794,14 +811,14 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
             search.match_reason = "exact"
             return shortcut
 
-        # === Step 4: Original Title Match ===
+        # === Step 5: Original Title Match ===
         # Try matching on the original (non-localized) title
         orig_match = match_by_original_title(search_results, search, media_type)
         if orig_match:
             search.match_reason = "original"
             return orig_match
 
-        # === Step 5: Alternate Titles / Fuzzy Match ===
+        # === Step 6: Alternate Titles / Fuzzy Match ===
         # Try alternate title match and high-confidence fuzzy matching
         fallback_match = attempt_fallbacks(search_results, search, media_type)
         if fallback_match:
@@ -812,7 +829,7 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
                 search.match_reason = "fuzzy"
             return fallback_match
 
-        # === Step 5b: Fuzzy fallback for collections ===
+        # === Step 6b: Fuzzy fallback for collections ===
         if media_type == "collection":
             candidates, scored = fuzzy_scoring(search_results, search)
             if candidates:
@@ -826,7 +843,7 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
                 search.match_reason = "collection_fuzzy"
                 return best
         
-        # === Step 6: Final Fallback for Single Match ===
+        # === Step 7: Final Fallback for Single Match ===
         # If all else fails, accept a single high-similarity result if no year is specified
         if retry and search.year is None and len(search_results) == 1:
             candidate = search_results[0]
@@ -841,7 +858,7 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
                 search.match_reason = "fallback_single"
                 return candidate
 
-        # === Step 7d-alt: Movie-to-TV fallback if search returned results but no confident match ===
+        # === Step 8: Movie-to-TV fallback if search returned results but no confident match ===
         if media_type == "movie":
             logger.info(f"🔄 No confident match as movie; retrying as TV series for “{search.title}”")
             console(f"🔄 Retrying as TV series: “{search.title}”", "YELLOW")
@@ -872,9 +889,9 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
     except Exception as e:
         console(f"[WARNING] Failed to query TMDB for '{orig_title}' ({search.year}) as {media_type}: {e}", "YELLOW")
         logger.warning(f"Failed to query TMDB for '{orig_title}' ({search.year}) as {media_type}: {e}")
-        # === Step 7: No Results Found ===
+        # === Step 9: No Results Found ===
         if "No Results Found" in str(e):
-            # === Step 7a: Unaccented Fallback ===
+            # === Step 9a: Unaccented Fallback ===
             if not retry_unidecode:
                 unaccented = unidecode(orig_title)
                 if unaccented != orig_title:
@@ -882,21 +899,21 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
                     logger.warning(f"🔁 Retrying with unaccented title: '{unaccented}'")
                     search.title = unaccented
                     return query_tmdb(search, media_type, retry=retry, retry_unidecode=True)
-            # === Step 7b: Underscore-to-Space Fallback ===
+            # === Step 9b: Underscore-to-Space Fallback ===
             if not retry and "_" in orig_title:
                 alt_title = orig_title.replace("_", " ")
                 console(f"[WARNING] 🔁 Retrying TMDB search with out underscores: '{alt_title}'", "YELLOW")
                 logger.warning(f"🔁 Retrying with spaces: '{alt_title}'")
                 search.title = alt_title
                 return query_tmdb(search, media_type, retry=True, retry_unidecode=retry_unidecode)
-            # === Step 7c: Hyphen-to-Space Fallback ===
+            # === Step 9c: Hyphen-to-Space Fallback ===
             if not retry and "-" in orig_title:
                 alt_title = orig_title.replace("-", " ")
                 console(f"[WARNING] 🔁 Retrying TMDB search without hyphens: '{alt_title}'", "YELLOW")
                 logger.warning(f"🔁 Retrying with spaces: '{alt_title}'")
                 search.title = alt_title
                 return query_tmdb(search, media_type, retry=True, retry_unidecode=retry_unidecode)
-            # === Step 7d: Movie-to-TV Fallback ===
+            # === Step 9d: Movie-to-TV Fallback ===
             if media_type == "movie" and hasattr(search, "files") and len(search.files) == 1:
                 logger.info(f"🔄 Movie lookup failed; retrying as TV series for single-file “{search.title}”")
                 console(f"🔄 Retrying as TV series: “{search.title}”", "YELLOW")
@@ -913,7 +930,7 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
                     search.type = "tv_series"
                     selected_id = getattr(tv_result, "id", None)
                     return tv_result
-            # === Step 7e: Retry with No Year ===
+            # === Step 9e: Retry with No Year ===
             if media_type in ("movie", "tv_series") and not retry:
                 logger.warning(f"🔁 Final fallback: retrying TMDB search with no year for “{search.title}”")
                 console(f"🔁 Final fallback: retrying TMDB search with no year", "YELLOW")
