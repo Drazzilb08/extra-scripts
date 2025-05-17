@@ -363,6 +363,9 @@ def generate_new_filename(media_item: 'MediaItem', old_filename: str) -> str:
         val = getattr(media_item, f"new_{attr}", None)
         if val is None:
             val = getattr(media_item, attr, None)
+        # Skip invalid imdb values that are integers or missing 'tt'
+        if prefix == 'imdb' and (not isinstance(val, str) or not val.startswith("tt")):
+            continue
         if val:
             id_parts.append(f"{prefix}-{val}")
     suffix = ''.join(f" {{{part}}}" for part in id_parts)
