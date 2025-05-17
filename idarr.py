@@ -17,6 +17,8 @@ FREQUENCY_DAYS = 30
 ### === Do not edit below here === ###
 
 version = "1.1.0"
+# This is the base version; full version string with build number is added dynamically
+BUILD_NUMBER = None
 import sys
 
 # === Rich Table for Summary ===
@@ -1341,6 +1343,14 @@ def main():
             console("❌ --filter requires at least one of --type, --year, or --contains", "RED")
             exit(1)
     load_runtime_config(args)
+    global BUILD_NUMBER
+    try:
+        import subprocess
+        BUILD_NUMBER = subprocess.check_output(['git', 'rev-list', '--count', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
+        full_version = f"{version}.build{BUILD_NUMBER}"
+    except Exception:
+        full_version = version
+    logger.info(f"************************* IDARR Version: {full_version} *************************")
     if DEBUG_MODE:
         print_settings()
     if args.revert:
