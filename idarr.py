@@ -10,7 +10,7 @@ SOURCE_DIRECTORY = ""
 # TMDB API Key: Set directly here or via the "TMDB_API_KEY" environment variable
 YOUR_TMDB_API_KEY = ""
 # Options: INFO/DEBUG
-LOG_LEVEL = "INFO"
+LOG_LEVEL = ""
 # Frequency that files will be checked against TMDB
 FREQUENCY_DAYS = 30
 
@@ -54,6 +54,32 @@ from difflib import SequenceMatcher
 from functools import wraps
 import json
 from datetime import datetime, timedelta
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+YEAR_REGEX: Pattern = re.compile(r"\s?\((\d{4})\)(?!.*Collection).*")
+SEASON_PATTERN: Pattern = re.compile(
+    r"(?:\s*-\s*Season\s*\d+|_Season\d{1,2}|\s*-\s*Specials|_Specials)", re.IGNORECASE
+)
+TMDB_ID_REGEX: Pattern = re.compile(r"tmdb[-_\s](\d+)")
+TVDB_ID_REGEX: Pattern = re.compile(r"tvdb[-_\s](\d+)")
+IMDB_ID_REGEX: Pattern = re.compile(r"imdb[-_\s](tt\d+)")
+
+UNMATCHED_CASES: List[Dict[str, Any]] = []
+TVDB_MISSING_CASES: List[Dict[str, Any]] = []
+# Track movie→tv reclassifications
+RECLASSIFIED: List[Dict[str, Any]] = []
+# TMDB_API_KEY and SOURCE_DIR will be loaded in load_runtime_config
+TMDB_API_KEY = None
+SOURCE_DIR = None
+
+# Create a single TMDb client for reuse (will be initialized in load_runtime_config)
+tmdb_client = None
+
+# DEBUG_MODE flag: True if LOG_LEVEL is DEBUG
+DEBUG_MODE = LOG_LEVEL.upper() == "DEBUG"
+
+IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp"]
 
 # === Cache utilities ===
 CACHE_PATH = os.path.expanduser("~/.cache/idarr_cache.json")
@@ -262,31 +288,6 @@ def sleep_and_notify(func):
                 console(f"\033[93m[WARNING]\033[0m Rate limit hit, sleeping for {e.period_remaining:.2f} seconds", "RED")
                 time.sleep(e.period_remaining)
     return wrapper
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-YEAR_REGEX: Pattern = re.compile(r"\s?\((\d{4})\)(?!.*Collection).*")
-SEASON_PATTERN: Pattern = re.compile(
-    r"(?:\s*-\s*Season\s*\d+|_Season\d{1,2}|\s*-\s*Specials|_Specials)", re.IGNORECASE
-)
-TMDB_ID_REGEX: Pattern = re.compile(r"tmdb[-_\s](\d+)")
-TVDB_ID_REGEX: Pattern = re.compile(r"tvdb[-_\s](\d+)")
-IMDB_ID_REGEX: Pattern = re.compile(r"imdb[-_\s](tt\d+)")
-
-UNMATCHED_CASES: List[Dict[str, Any]] = []
-TVDB_MISSING_CASES: List[Dict[str, Any]] = []
-# Track movie→tv reclassifications
-RECLASSIFIED: List[Dict[str, Any]] = []
-# TMDB_API_KEY and SOURCE_DIR will be loaded in load_runtime_config
-TMDB_API_KEY = None
-SOURCE_DIR = None
-
-# Create a single TMDb client for reuse (will be initialized in load_runtime_config)
-tmdb_client = None
-
-# DEBUG_MODE flag: True if LOG_LEVEL is DEBUG
-DEBUG_MODE = LOG_LEVEL.upper() == "DEBUG"
-
-IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp"]
 
 # === LOGGER SETUP ===
 LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
@@ -767,13 +768,12 @@ def query_tmdb(search: dict, media_type: str, retry: bool = False, retry_unideco
             if result:
                 return result
 
-        # === Step 1b: Lookup by TMDB Title/Year ===
         search_results = perform_tmdb_search(search, media_type)
         if not search_results:
             search_results = []
 
         # Debug output for search results (if enabled)
-        if DEBUG_MODE and search_results:
+        if LOG_LEVEL == "DEBUG" and search_results:
             console(f"[DEBUG] Raw search results for “{orig_title}” [{media_type}]:", "BLUE")
             for idx, res in enumerate(search_results, start=1):
                 title = getattr(res, 'title', getattr(res, 'name', getattr(res, 'original_title', '')))
@@ -1021,7 +1021,7 @@ def rename_files(items: List[MediaItem]) -> list:
     # Set the global duplicates dir next to idarr.py
     duplicates_dir = os.path.join(SCRIPT_DIR, "duplicates")
     os.makedirs(duplicates_dir, exist_ok=True)
-    if file_updates or DEBUG_MODE:
+    if file_updates or LOG_LEVEL == "DEBUG":
         console(f"📂 Renaming files:")
         logger.info(f"📂 Renaming files:")
     for media_item in items:
@@ -1034,7 +1034,7 @@ def rename_files(items: List[MediaItem]) -> list:
             new_filename = generate_new_filename(media_item, old_filename)
             new_path = os.path.join(directory, new_filename)
             if old_filename == new_filename:
-                if DEBUG_MODE:
+                if LOG_LEVEL == "DEBUG":
                     console(f"⏭️ Skipping unchanged file: {old_filename}", "YELLOW")
                     logger.debug(f"Skipping unchanged file: {old_filename}")
                 skipped += 1
@@ -1213,14 +1213,12 @@ def parse_args():
     return parser.parse_args()
 
 def load_runtime_config(args) -> None:
-    global DRY_RUN, QUIET, SOURCE_DIR, YOUR_TMDB_API_KEY, LOG_LEVEL, FREQUENCY_DAYS, CACHE_PATH, DEBUG_MODE, CACHE, TMDB_API_KEY, tmdb_client
-    # Force reloading of .env to ensure latest changes are read
+    global DRY_RUN, QUIET, SOURCE_DIR, YOUR_TMDB_API_KEY, LOG_LEVEL, FREQUENCY_DAYS, CACHE_PATH, CACHE, TMDB_API_KEY, tmdb_client
     dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     load_dotenv(dotenv_path, override=True)
 
     DRY_RUN = args.dry_run
     QUIET = args.quiet
-    # Resolve environment variables after loading .env
     SOURCE_DIR = os.environ.get("SOURCE_DIR", SOURCE_DIRECTORY)
     if args.source:
         SOURCE_DIR = args.source
@@ -1228,9 +1226,15 @@ def load_runtime_config(args) -> None:
     if args.tmdb_api_key:
         YOUR_TMDB_API_KEY = args.tmdb_api_key
     TMDB_API_KEY = YOUR_TMDB_API_KEY
-    LOG_LEVEL = args.log_level.upper()
+
+    # CLI flag overrides env, then default
+    LOG_LEVEL = args.log_level.upper() if args.log_level else os.environ.get("LOG_LEVEL", "INFO").upper()
+
+    # **PATCH: If --debug is passed, force LOG_LEVEL to DEBUG**
+    if args.debug:
+        LOG_LEVEL = "DEBUG"
+
     FREQUENCY_DAYS = args.frequency_days
-    DEBUG_MODE = args.debug or LOG_LEVEL == "DEBUG"
     if args.cache_path:
         CACHE_PATH = args.cache_path
     if args.no_cache:
@@ -1243,6 +1247,7 @@ def load_runtime_config(args) -> None:
         CACHE = {}
     # Create a single TMDb client for reuse
     tmdb_client = TMDbAPIs(TMDB_API_KEY)
+
 def print_settings():
     """
     Print current runtime settings for debugging and transparency.
@@ -1255,7 +1260,6 @@ def print_settings():
         "LOG_LEVEL": LOG_LEVEL,
         "FREQUENCY_DAYS": FREQUENCY_DAYS,
         "CACHE_PATH": CACHE_PATH,
-        "DEBUG_MODE": DEBUG_MODE,
     }
     console("🔧 Current Settings", "BLUE")
     for key, value in settings.items():
@@ -1409,7 +1413,7 @@ def main():
             exit(1)
     load_runtime_config(args)
     logger.info(f"************************* IDARR Version: {full_version} *************************")
-    if DEBUG_MODE:
+    if LOG_LEVEL == "DEBUG":
         print_settings()
     if args.revert:
         items = scan_files_in_flat_folder(SOURCE_DIR)
