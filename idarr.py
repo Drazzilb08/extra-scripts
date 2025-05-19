@@ -445,8 +445,8 @@ def normalize_with_aliases(s: str) -> str:
 
 def create_collection(
     title: str,
-    imdb_id: Optional[str],
     tmdb_id: Optional[int],
+    imdb_id: Optional[str],
     files: List[str]
 ) -> Dict[str, Any]:
     """
