@@ -16,7 +16,7 @@ FREQUENCY_DAYS = 30
 
 ### === Do not edit below here === ###
 
-version = "1.1.0"
+version = "1.1.1"
 # This is the base version; full version string with build number is added dynamically
 BUILD_NUMBER = None
 import sys
@@ -732,8 +732,8 @@ def fetch_by_tmdb_id(search: 'MediaItem', media_type: str) -> Optional[Any]:
     Returns the matching TMDB item if found, or None on failure.
     """
     try:
-        logger.info(f"🔍 Step 1: Fetching TMDB {media_type} by TMDB ID {search.tmdb_id}")
-        console(f"🔍 Step 1: Using TMDB ID: {search.tmdb_id}", "BLUE")
+        logger.info(f"🔍 Fetching TMDB {media_type} by TMDB ID {search.tmdb_id}")
+        console(f"🔍 Using TMDB ID: {search.tmdb_id}")
         if media_type == "movie":
             return tmdb_client._api.movies_get_details(search.tmdb_id)
         elif media_type == "tv_series":
@@ -1003,16 +1003,24 @@ def rename_files(items: List[MediaItem]) -> list:
     """
     Rename files for all enriched MediaItem objects, respecting DRY_RUN mode.
     Handles filename conflicts, length limits, and logs all actions.
+    In case of a conflict, keeps the file with the newest creation date,
+    moves the older file to a global `duplicates` folder next to idarr.py, and logs this in a CSV.
     Args:
         items: List of MediaItem instances to process.
     Returns:
         List of tuples (media_type, old_filename, new_filename) for updated files.
     """
+    import shutil
+
     mode = "DRY RUN" if DRY_RUN else "LIVE"
     logger.info(f"🏷  Starting file rename process ({mode} mode)")
-    file_updates = []  # collects tuples of (media_type, old_filename, new_filename)
+    file_updates = []
+    duplicate_log = []
     renamed, skipped = 0, 0
     existing_filenames = {f.lower() for f in os.listdir(SOURCE_DIR)}
+    # Set the global duplicates dir next to idarr.py
+    duplicates_dir = os.path.join(SCRIPT_DIR, "duplicates")
+    os.makedirs(duplicates_dir, exist_ok=True)
     if file_updates or DEBUG_MODE:
         console(f"📂 Renaming files:")
         logger.info(f"📂 Renaming files:")
@@ -1020,12 +1028,11 @@ def rename_files(items: List[MediaItem]) -> list:
         media_type = media_item.type
         if getattr(media_item, "match_failed", False):
             continue
-        # Define a per-item header flag for tv_series DRY_RUN grouping
         header_printed = False
         for index, file_path in enumerate(media_item.files):
             directory, old_filename = os.path.split(file_path)
-            # Use generate_new_filename to ensure ID suffixes and updated year/title are preserved
             new_filename = generate_new_filename(media_item, old_filename)
+            new_path = os.path.join(directory, new_filename)
             if old_filename == new_filename:
                 if DEBUG_MODE:
                     console(f"⏭️ Skipping unchanged file: {old_filename}", "YELLOW")
@@ -1037,25 +1044,65 @@ def rename_files(items: List[MediaItem]) -> list:
                 logger.warning(f"⛔ Skipped (too long): {new_filename}")
                 skipped += 1
                 continue
-            if new_filename.lower() in existing_filenames and old_filename.lower() != new_filename.lower():
-                console(f"  ⚠️  Skipped (name conflict): {new_filename}", "YELLOW")
-                logger.warning(f"  ⚠️  Skipped (name conflict): {new_filename}")
-                skipped += 1
-                continue
-            new_path = os.path.join(directory, new_filename)
-            if old_filename == new_filename:
+            conflict_path = os.path.join(directory, new_filename)
+            if os.path.exists(conflict_path) and old_filename.lower() != new_filename.lower():
+                src_stat = os.stat(file_path)
+                dst_stat = os.stat(conflict_path)
+                src_ctime = getattr(src_stat, "st_ctime", src_stat.st_mtime)
+                dst_ctime = getattr(dst_stat, "st_ctime", dst_stat.st_mtime)
+                if src_ctime >= dst_ctime:
+                    keep_path, keep_file = file_path, old_filename
+                    move_path, move_file = conflict_path, new_filename
+                    action = "kept_source"
+                else:
+                    keep_path, keep_file = conflict_path, new_filename
+                    move_path, move_file = file_path, old_filename
+                    action = "kept_existing"
+                # Prepare unique destination in global duplicates_dir
+                base_move_file = os.path.basename(move_file)
+                duplicate_dest = os.path.join(duplicates_dir, base_move_file)
+                if os.path.exists(duplicate_dest):
+                    # Append timestamp to avoid overwrite in duplicates/
+                    ts = int(time.time())
+                    name, ext = os.path.splitext(base_move_file)
+                    duplicate_dest = os.path.join(duplicates_dir, f"{name}_{ts}{ext}")
+                if not DRY_RUN:
+                    try:
+                        shutil.move(move_path, duplicate_dest)
+                        logger.info(f"🗂️ Conflict: Moved older file '{move_file}' to '{duplicate_dest}'")
+                        console(f"🗂️ Conflict: Moved older file '{move_file}' to '{duplicate_dest}'", "YELLOW")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to move duplicate '{move_file}': {e}")
+                        skipped += 1
+                        continue
+                else:
+                    logger.info(f"[DRY RUN] Would move older file '{move_file}' to '{duplicate_dest}'")
+                    console(f"[DRY RUN] Would move older file '{move_file}' to '{duplicate_dest}'", "YELLOW")
+                if src_ctime >= dst_ctime:
+                    if not DRY_RUN:
+                        os.rename(file_path, conflict_path)
+                    renamed += 1
+                    file_updates.append((media_type, old_filename, new_filename))
+                else:
+                    skipped += 1
+                duplicate_log.append({
+                    "action": action,
+                    "kept_file": keep_file,
+                    "kept_path": os.path.join(directory, keep_file),
+                    "kept_ctime": src_ctime if src_ctime >= dst_ctime else dst_ctime,
+                    "moved_file": move_file,
+                    "moved_path": duplicate_dest,
+                    "moved_ctime": dst_ctime if src_ctime >= dst_ctime else src_ctime,
+                })
                 continue
             if DRY_RUN:
                 if media_type == "tv_series":
-                    # Determine base title and year for header
                     base_title = media_item.new_title if media_item.new_title is not None else media_item.title
                     base_year = media_item.new_year if media_item.new_year is not None else media_item.year
-                    # Print series header once
                     if not header_printed:
                         console(f"[DRY RUN] Series: {base_title} ({base_year})")
                         logger.info(f"[DRY RUN] Series: {base_title} ({base_year})")
                         header_printed = True
-                    # Print each file rename as a bullet
                     console(f"  • {old_filename} -> {new_filename}")
                     logger.info(f"  • {old_filename} -> {new_filename}")
                     if old_filename != new_filename:
@@ -1067,7 +1114,6 @@ def rename_files(items: List[MediaItem]) -> list:
                     file_updates.append((media_type, old_filename, new_filename))
                     continue
                 else:
-                    # existing non-tv_series DRY_RUN logic unchanged
                     msg = f"[DRY RUN] → {old_filename} -> {new_filename}"
                     console(msg)
                     logger.info(msg)
@@ -1090,7 +1136,6 @@ def rename_files(items: List[MediaItem]) -> list:
                     console(f"❌ Failed to rename {old_filename}: {e}", "RED")
                     logger.error(f"❌ Failed to rename {old_filename}: {e}")
                     skipped += 1
-    # Print renaming header if any files were renamed or debug mode is on
     if DRY_RUN:
         logger.info("")
         logger.info("📋 Rename Summary:")
@@ -1103,7 +1148,6 @@ def rename_files(items: List[MediaItem]) -> list:
         logger.info(f"  ✔️  {renamed} file(s) renamed")
         logger.info(f"  ⚠️  {skipped} file(s) skipped (conflicts or errors)")
         logger.info("")
-    # Backup of renamed files
     if file_updates:
         backup_path = os.path.join(LOG_DIR, "renamed_backup.json")
         with open(backup_path, "w") as f:
@@ -1112,6 +1156,19 @@ def rename_files(items: List[MediaItem]) -> list:
                 for typ, old, new in file_updates
             ], f, indent=2)
         logger.info(f"📝 Backup of renamed files written to {backup_path}")
+    if duplicate_log:
+        duplicates_csv_path = os.path.join(LOG_DIR, "duplicates_log.csv")
+        import csv
+        with open(duplicates_csv_path, "w", newline="") as csvfile:
+            fieldnames = [
+                "action", "kept_file", "kept_path", "kept_ctime",
+                "moved_file", "moved_path", "moved_ctime"
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in duplicate_log:
+                writer.writerow(row)
+        logger.info(f"🗂️ Duplicates conflict log written to {duplicates_csv_path}")
     return file_updates
 
 def parse_args():
@@ -1120,7 +1177,7 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    parser.add_argument("--version", action="version", version=f"idarr.py {version}")
+    parser.add_argument("--version", action="version", version=f"idarr.py {full_version}")
 
     # --- General Options ---
     general = parser.add_argument_group("General Options")
@@ -1337,19 +1394,20 @@ def summarize_run(start_time: float, items: List[MediaItem], updated_items: List
         save_cache(CACHE, active_keys)
 
 def main():
-    args = parse_args()
-    if args.filter:
-        if not (args.type or args.year or args.contains):
-            console("❌ --filter requires at least one of --type, --year, or --contains", "RED")
-            exit(1)
-    load_runtime_config(args)
     global BUILD_NUMBER
+    global full_version
     try:
         import subprocess
         BUILD_NUMBER = subprocess.check_output(['git', 'rev-list', '--count', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
         full_version = f"{version}.build{BUILD_NUMBER}"
     except Exception:
         full_version = version
+    args = parse_args()
+    if args.filter:
+        if not (args.type or args.year or args.contains):
+            console("❌ --filter requires at least one of --type, --year, or --contains", "RED")
+            exit(1)
+    load_runtime_config(args)
     logger.info(f"************************* IDARR Version: {full_version} *************************")
     if DEBUG_MODE:
         print_settings()
