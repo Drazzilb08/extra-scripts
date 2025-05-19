@@ -565,14 +565,16 @@ def scan_files_in_flat_folder(SOURCE_DIR: str) -> List[MediaItem]:
         ext = os.path.splitext(file)[-1].lower()
         if ext not in IMAGE_EXTENSIONS:
             full_path = os.path.join(SOURCE_DIR, file)
-            if DRY_RUN:
-                logger.info(f"[DRY RUN] Would delete non-image file: {file}")
-            else:
-                try:
-                    os.remove(full_path)
-                    logger.info(f"🗑️ Removed non-image file: {file}")
-                except Exception as e:
-                    logger.error(f"❌ Failed to delete {file}: {e}")
+            if REMOVE_NON_IMAGE_FILES:
+                if DRY_RUN:
+                    logger.info(f"[DRY RUN] Would delete non-image file: {file}")
+                else:
+                    try:
+                        os.remove(full_path)
+                        logger.info(f"🗑️ Removed non-image file: {file}")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to delete {file}: {e}")
+            # Always skip further processing of non-image files
             continue
         title = file.rsplit('.', 1)[0]
         raw_title = SEASON_PATTERN.split(title)[0].strip()
@@ -1188,6 +1190,7 @@ def parse_args():
     general.add_argument("--log-level", metavar="LEVEL", type=str, default="INFO", help="Logging level (e.g., DEBUG, INFO)")
     general.add_argument("--debug", action="store_true", help="Enable debug logging output")
     general.add_argument("--limit", metavar="N", type=int, help="Maximum number of items to process")
+    general.add_argument("--remove-non-image-files", action="store_true", help="If set, actually remove non-image files (default: ignore them)")
 
     # --- Caching Options ---
     cache = parser.add_argument_group("Caching Options")
@@ -1213,7 +1216,7 @@ def parse_args():
     return parser.parse_args()
 
 def load_runtime_config(args) -> None:
-    global DRY_RUN, QUIET, SOURCE_DIR, YOUR_TMDB_API_KEY, LOG_LEVEL, FREQUENCY_DAYS, CACHE_PATH, CACHE, TMDB_API_KEY, tmdb_client
+    global DRY_RUN, QUIET, SOURCE_DIR, YOUR_TMDB_API_KEY, LOG_LEVEL, FREQUENCY_DAYS, CACHE_PATH, CACHE, TMDB_API_KEY, tmdb_client, REMOVE_NON_IMAGE_FILES
     dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     load_dotenv(dotenv_path, override=True)
 
@@ -1245,6 +1248,7 @@ def load_runtime_config(args) -> None:
         if os.path.exists(CACHE_PATH):
             os.remove(CACHE_PATH)
         CACHE = {}
+    REMOVE_NON_IMAGE_FILES = args.remove_non_image_files
     # Create a single TMDb client for reuse
     tmdb_client = TMDbAPIs(TMDB_API_KEY)
 
