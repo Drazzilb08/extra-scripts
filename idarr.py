@@ -10,7 +10,7 @@ import string
 import time
 import argparse
 import shutil
-from typing import List, Dict, Pattern, Optional, Tuple, Any
+from typing import Pattern, Optional, Any
 from collections import defaultdict
 from difflib import SequenceMatcher
 from types import SimpleNamespace
@@ -18,8 +18,8 @@ from functools import wraps
 import json
 from datetime import datetime, timedelta
 
-if sys.version_info < (3, 10):
-    print("Python 3.10 or higher is required. Detected version: {}.{}.{}".format(*sys.version_info[:3]))
+if sys.version_info < (3, 9):
+    print("Python 3.9 or higher is required. Detected version: {}.{}.{}".format(*sys.version_info[:3]))
     exit(1)
 try:
     from tmdbapis import TMDbAPIs
@@ -50,14 +50,14 @@ SEASON_PATTERN: Pattern = re.compile(r"(?:\s*-\s*Season\s*\d+|_Season\d{1,2}|\s*
 TMDB_ID_REGEX: Pattern = re.compile(r"tmdb[-_\s](\d+)")
 TVDB_ID_REGEX: Pattern = re.compile(r"tvdb[-_\s](\d+)")
 IMDB_ID_REGEX: Pattern = re.compile(r"imdb[-_\s](tt\d+)")
-UNMATCHED_CASES: List[Dict[str, Any]] = []
-TVDB_MISSING_CASES: List[Dict[str, Any]] = []
-RECLASSIFIED: List[Dict[str, Any]] = []
+UNMATCHED_CASES: list[dict[str, Any]] = []
+TVDB_MISSING_CASES: list[dict[str, Any]] = []
+RECLASSIFIED: list[dict[str, Any]] = []
 IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp"]
 CACHE_PATH = os.path.join(SCRIPT_DIR, "cache", "idarr_cache.json")
 
 
-def load_cache() -> Dict[str, Any]:
+def load_cache() -> dict[str, Any]:
     """
     Load the cache from the cache file if it exists.
     Returns:
@@ -69,7 +69,7 @@ def load_cache() -> Dict[str, Any]:
     return {}
 
 
-def save_cache(cache: Dict[str, Any], active_keys: set[str]) -> None:
+def save_cache(cache: dict[str, Any], active_keys: set[str]) -> None:
     """
     Save the cache to the cache file, filtering to only include active keys.
     Args:
@@ -137,7 +137,7 @@ class MediaItem:
         tmdb_id: Optional[int],
         tvdb_id: Optional[int] = None,
         imdb_id: Optional[str] = None,
-        files: Optional[List[str]] = None,
+        files: Optional[list[str]] = None,
     ) -> None:
         self.type = type
         self.title = title
@@ -255,7 +255,7 @@ class MediaItem:
             ]
         )
 
-    def filenames(self) -> List[Tuple[str, str]]:
+    def filenames(self) -> list[tuple[str, str]]:
         """
         Generate (old_filename, new_filename) tuples for each file.
         Does not perform I/O.
@@ -430,7 +430,7 @@ def normalize_with_aliases(string: str) -> str:
     return string_ascii
 
 
-def create_collection(title: str, tmdb_id: Optional[int], imdb_id: Optional[str], files: List[str]) -> Dict[str, Any]:
+def create_collection(title: str, tmdb_id: Optional[int], imdb_id: Optional[str], files: list[str]) -> dict[str, Any]:
     """
     Create a collection dictionary for MediaItem initialization.
     """
@@ -450,8 +450,8 @@ def create_series(
     tvdb_id: Optional[int],
     imdb_id: Optional[str],
     tmdb_id: Optional[int],
-    files: List[str],
-) -> Dict[str, Any]:
+    files: list[str],
+) -> dict[str, Any]:
     """
     Create a tv_series dictionary for MediaItem initialization.
     """
@@ -471,8 +471,8 @@ def create_movie(
     year: Optional[int],
     tmdb_id: Optional[int],
     imdb_id: Optional[str],
-    files: List[str],
-) -> Dict[str, Any]:
+    files: list[str],
+) -> dict[str, Any]:
     """
     Create a movie dictionary for MediaItem initialization.
     """
@@ -486,7 +486,7 @@ def create_movie(
     }
 
 
-def extract_ids(text: str) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+def extract_ids(text: str) -> tuple[Optional[int], Optional[int], Optional[str]]:
     """
     Extract TMDB, TVDB, and IMDB IDs from a string.
     Returns:
@@ -501,7 +501,7 @@ def extract_ids(text: str) -> Tuple[Optional[int], Optional[int], Optional[str]]
     return tmdb, tvdb, imdb
 
 
-def parse_file_group(config: SimpleNamespace, base_name: str, files: List[str]) -> MediaItem:
+def parse_file_group(config: SimpleNamespace, base_name: str, files: list[str]) -> MediaItem:
     """
     Parse a group of files and return a MediaItem instance.
     Args:
@@ -529,7 +529,7 @@ def parse_file_group(config: SimpleNamespace, base_name: str, files: List[str]) 
     return MediaItem(**data, config=config)
 
 
-def scan_files_in_flat_folder(config: SimpleNamespace) -> List[MediaItem]:
+def scan_files_in_flat_folder(config: SimpleNamespace) -> list[MediaItem]:
     """
     Scan a flat folder for image assets and group them into MediaItem instances.
     Args:
@@ -581,7 +581,7 @@ def scan_files_in_flat_folder(config: SimpleNamespace) -> List[MediaItem]:
     return assets_dict
 
 
-def exact_match_shortcut(search_results: List[Any], search: MediaItem) -> Optional[Any]:
+def exact_match_shortcut(search_results: list[Any], search: MediaItem) -> Optional[Any]:
     norm_search = normalize_with_aliases(search.title)
     for res in search_results:
         title = getattr(res, "title", getattr(res, "name", ""))
@@ -593,7 +593,7 @@ def exact_match_shortcut(search_results: List[Any], search: MediaItem) -> Option
     return None
 
 
-def alternate_titles_fallback(search_results: List[Any], search: MediaItem, media_type: str) -> Optional[Any]:
+def alternate_titles_fallback(search_results: list[Any], search: MediaItem, media_type: str) -> Optional[Any]:
     norm_search = normalize_with_aliases(search.title)
     for res in search_results:
         alt_list = getattr(res, "alternative_titles", [])
@@ -604,7 +604,7 @@ def alternate_titles_fallback(search_results: List[Any], search: MediaItem, medi
     return None
 
 
-def perform_tmdb_search(search: MediaItem, media_type: str) -> Optional[List[Any]]:
+def perform_tmdb_search(search: MediaItem, media_type: str) -> Optional[list[Any]]:
     if media_type == "collection":
         return TMDB_CLIENT.collection_search(query=search.title)
     elif media_type == "movie":
@@ -617,7 +617,7 @@ def perform_tmdb_search(search: MediaItem, media_type: str) -> Optional[List[Any
         return None
 
 
-def match_by_id(search_results: List[Any], search: MediaItem, media_type: str) -> Optional[Any]:
+def match_by_id(search_results: list[Any], search: MediaItem, media_type: str) -> Optional[Any]:
     for res in search_results:
         if (
             (getattr(search, "tmdb_id", None) and getattr(res, "id", None) == search.tmdb_id)
@@ -628,7 +628,7 @@ def match_by_id(search_results: List[Any], search: MediaItem, media_type: str) -
     return None
 
 
-def match_by_original_title(search_results: List[Any], search: MediaItem, media_type: str) -> Optional[Any]:
+def match_by_original_title(search_results: list[Any], search: MediaItem, media_type: str) -> Optional[Any]:
     for res in search_results:
         orig_title = getattr(res, "original_title", None)
         if orig_title and normalize_with_aliases(orig_title) == normalize_with_aliases(search.title):
@@ -643,7 +643,7 @@ def match_by_original_title(search_results: List[Any], search: MediaItem, media_
 
 
 def fuzzy_match_candidates(
-    search_results: List[Any],
+    search_results: list[Any],
     search: MediaItem,
     *,
     strict: bool = True,
@@ -1052,7 +1052,7 @@ def query_tmdb(search: MediaItem, media_type: str, retry: bool = False, retry_un
                 return query_tmdb(search, media_type, retry=True, retry_unidecode=retry_unidecode)
 
 
-def handle_data(config, items: List[MediaItem]) -> List[MediaItem]:
+def handle_data(config, items: list[MediaItem]) -> list[MediaItem]:
     """
     Enrich a list of MediaItem objects with metadata from TMDB.
     Updates UNMATCHED_CASES and TVDB_MISSING_CASES as needed.
@@ -1108,7 +1108,7 @@ def handle_data(config, items: List[MediaItem]) -> List[MediaItem]:
     return items
 
 
-def rename_files(items: List[MediaItem], config) -> tuple:
+def rename_files(items: list[MediaItem], config) -> tuple:
     """
     Rename files for all enriched MediaItem objects, respecting DRY_RUN mode.
     Handles filename conflicts, length limits, and logs all actions.
@@ -1492,7 +1492,7 @@ def print_settings(config):
     console.print(table)
 
 
-def perform_revert(config, items: List[MediaItem]) -> bool:
+def perform_revert(config, items: list[MediaItem]) -> bool:
     if config.revert:
         revert_path = os.path.join(LOG_DIR, "renamed_backup.json")
         if not os.path.exists(revert_path):
@@ -1515,7 +1515,7 @@ def perform_revert(config, items: List[MediaItem]) -> bool:
     return False
 
 
-def filter_items(args, items: List[MediaItem]) -> List[MediaItem]:
+def filter_items(args, items: list[MediaItem]) -> list[MediaItem]:
     if args.filter:
         if args.type:
             items = [i for i in items if i.type == args.type]
@@ -1543,7 +1543,7 @@ def filter_items(args, items: List[MediaItem]) -> List[MediaItem]:
     return items
 
 
-def export_csvs(updated_items: List[MediaItem], file_updates: list) -> None:
+def export_csvs(updated_items: list[MediaItem], file_updates: list) -> None:
     csv_path = os.path.join(LOG_DIR, "updated_files.csv")
     column_order = [
         "media_type",
@@ -1662,8 +1662,8 @@ def export_unmatched_cases_csv():
 
 def summarize_run(
     start_time: float,
-    items: List[MediaItem],
-    updated_items: List[MediaItem],
+    items: list[MediaItem],
+    updated_items: list[MediaItem],
     file_updates: list,
     config,
 ) -> None:
