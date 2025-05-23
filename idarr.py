@@ -977,17 +977,13 @@ def query_tmdb(search: MediaItem, media_type: str, retry: bool = False, retry_un
                 return tv_result
 
         msg = f"🤷 No confident match found for “{search.title}” ({search.year})"
-        raise NoResultsError(msg)
+        console(msg)
+        logger.warning(msg)
+        return None
 
     except ConnectionError as ce:
         console(f"[ERROR] Connection failed for '{search.title}': {ce}", "RED")
         logger.error(f" Connection failed for '{search.title}': {ce}")
-    except NoResultsError as nre:
-        # Only log/display this warning if not a retry (i.e. top-level call)
-        if not retry and not retry_unidecode:
-            logger.warning(str(nre))
-            console(f"[WARNING] {str(nre)}", "YELLOW")
-        raise
     except Exception as e:
         console(
             f"[WARNING] Failed to query TMDB for '{orig_title}' ({search.year}) as {media_type}: {e}",
