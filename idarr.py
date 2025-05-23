@@ -548,7 +548,7 @@ def scan_files_in_flat_folder(config: SimpleNamespace) -> List[MediaItem]:
         if file.startswith("."):
             continue
         ext = os.path.splitext(file)[-1].lower()
-        if ext not in IMAGE_EXTENSIONS:
+        if ext not in IMAGE_EXTENSIONS and config.remove_non_image_files:
             full_path = os.path.join(config.source_dir, file)
             if config.source_dir:
                 if config.dry_run:
