@@ -6,3 +6,5 @@ test*
 .DS_Store
 /.archives
 /cache
+/duplicates
+pyproject.toml
