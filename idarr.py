@@ -1,4 +1,4 @@
-version = "1.2.0"
+version = "1.3.0"
 
 import sys
 import os
@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 if sys.version_info < (3, 9):
     print("Python 3.9 or higher is required. Detected version: {}.{}.{}".format(*sys.version_info[:3]))
     exit(1)
+
 try:
     from tmdbapis import TMDbAPIs
     from ratelimit import limits, RateLimitException
@@ -45,6 +46,12 @@ except Exception:
     FULL_VERSION = version
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+log_path = os.path.join(LOG_DIR, "idarr.log")
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 YEAR_REGEX: Pattern = re.compile(r"\s?\((\d{4})\)(?!.*Collection).*")
 SEASON_PATTERN: Pattern = re.compile(r"(?:\s*-\s*Season\s*\d+|_Season\d{1,2}|\s*-\s*Specials|_Specials)", re.IGNORECASE)
 TMDB_ID_REGEX: Pattern = re.compile(r"tmdb[-_\s](\d+)")
@@ -55,6 +62,31 @@ TVDB_MISSING_CASES: list[dict[str, Any]] = []
 RECLASSIFIED: list[dict[str, Any]] = []
 IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp"]
 CACHE_PATH = os.path.join(SCRIPT_DIR, "cache", "idarr_cache.json")
+PENDING_MATCHES_PATH = os.path.join(LOG_DIR, "pending_matches.json")
+
+
+def parse_tmdb_url(url: str):
+    """
+    Given a TMDB URL, returns (tmdb_id, type) tuple, or (None, None) if not parsable.
+    Example: https://www.themoviedb.org/movie/586595-after-midnight -> (586595, "movie")
+    """
+    m = re.match(r'https?://www\.themoviedb\.org/(movie|tv|collection)/(\d+)', url)
+    if not m:
+        return None, None
+    tmap = {"movie": "movie", "tv": "tv_series", "collection": "collection"}
+    return int(m.group(2)), tmap.get(m.group(1))
+
+# Pending matches utilities
+def load_pending_matches() -> dict[str, int | None]:
+    if os.path.exists(PENDING_MATCHES_PATH):
+        with open(PENDING_MATCHES_PATH, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_pending_matches(pending: dict[str, int | None]) -> None:
+    os.makedirs(os.path.dirname(PENDING_MATCHES_PATH), exist_ok=True)
+    with open(PENDING_MATCHES_PATH, "w") as f:
+        json.dump(pending, f, indent=2)
 
 
 def load_cache() -> dict[str, Any]:
@@ -117,6 +149,16 @@ def console(msg: str, level: str = "WHITE") -> None:
         print(f"{colors.get(level,'')}{msg}{end}")
 
 
+def get_cache_key(item) -> str:
+    tmdb = getattr(item, "new_tmdb_id", None) or getattr(item, "tmdb_id", None)
+    tvdb = getattr(item, "new_tvdb_id", None) or getattr(item, "tvdb_id", None)
+    imdb = getattr(item, "new_imdb_id", None) or getattr(item, "imdb_id", None)
+    if tmdb or tvdb or imdb:
+        return f"{tmdb or 'no-tmdb'}-{tvdb or 'no-tvdb'}-{imdb or 'no-imdb'}-{item.type}"
+    normalized_title = normalize_with_aliases(item.title)
+    return f"{normalized_title}-{item.year or 'noyear'}-{item.type}"
+
+
 class NoResultsError(Exception):
     """Custom exception for TMDB lookups that return no results."""
 
@@ -153,7 +195,11 @@ class MediaItem:
         self.new_imdb_id: Optional[str] = None
         self.match_failed: bool = False
         self.match_reason: Optional[str] = None
+        self.unmatched: bool = False
+        self.reclassified: bool = False
+        self.is_ambiguous: bool = False
         self.config = config
+        self.renamed: bool = False
 
     def enrich(self) -> bool:
         """
@@ -162,9 +208,12 @@ class MediaItem:
         Returns:
             True if enrichment succeeded, False otherwise.
         """
-        cache_key = f"{self.title} ({self.year}) [{self.type}]"
+        if not hasattr(self.config, "_api_calls"):
+            self.config._api_calls = 0
+        cache_key = get_cache_key(self)
         cached = self.config.cache.get(cache_key)
         should_skip = not self.config.dry_run and cached and is_recent(cached.get("last_checked", ""))
+        self.skipped_by_cache = should_skip
 
         if not self.config.quiet and not should_skip:
             console("")
@@ -172,21 +221,21 @@ class MediaItem:
 
         if should_skip:
             if cached.get("no_result"):
-                logger.info(f"📦 Skipping (previously not found): {cache_key}")
+                logger.info(f"📦 Skipping (previously not found): {self.title} ({self.year})")
                 return False
             self.new_title = cached.get("title")
             self.new_year = cached.get("year")
             self.new_tmdb_id = cached.get("tmdb_id")
             self.new_tvdb_id = cached.get("tvdb_id")
             self.new_imdb_id = cached.get("imdb_id")
-            logger.info(f"📦 Used cached metadata for {cache_key}")
+            logger.info(f"📦 Used cached metadata for {self.new_title or self.title} ({self.new_year or self.year})")
             return True
+        self.config._api_calls += 1
         result = query_tmdb(
             self,
             self.type,
         )
         if not result:
-
             self.config.cache[cache_key] = {
                 "last_checked": datetime.now().isoformat(),
                 "no_result": True,
@@ -194,14 +243,14 @@ class MediaItem:
             self.match_failed = True
             return False
 
-        if hasattr(result, "id") and result.id != self.tmdb_id:
-            if result.id and result.id != self.tmdb_id:
+        if hasattr(result, "id"):
+            if result.id and (self.tmdb_id is None or result.id != self.tmdb_id):
                 if not self.config.quiet:
                     console(f"  ⚠️ TMDB ID mismatch: {self.tmdb_id} → {result.id}", "YELLOW")
                 logger.warning(f"  ⚠️ TMDB ID mismatch: {self.tmdb_id} → {result.id}")
             self.new_tmdb_id = result.id
-        if hasattr(result, "tvdb_id") and result.tvdb_id != self.tvdb_id:
-            if getattr(result, "tvdb_id", None) and result.tvdb_id != self.tvdb_id:
+        if hasattr(result, "tvdb_id"):
+            if getattr(result, "tvdb_id", None) and (self.tvdb_id is None or result.tvdb_id != self.tvdb_id):
                 if not self.config.quiet:
                     console(
                         f"  ⚠️ TVDB ID mismatch: {self.tvdb_id} → {result.tvdb_id}",
@@ -209,8 +258,9 @@ class MediaItem:
                     )
                 logger.warning(f"  ⚠️ TVDB ID mismatch: {self.tvdb_id} → {result.tvdb_id}")
             self.new_tvdb_id = result.tvdb_id
-        if hasattr(result, "imdb_id") and result.imdb_id != self.imdb_id:
-            if getattr(result, "imdb_id", None) and result.imdb_id != self.imdb_id:
+        if hasattr(result, "imdb_id"):
+            # Always log when the original is None or changes
+            if getattr(result, "imdb_id", None) and (self.imdb_id is None or result.imdb_id != self.imdb_id):
                 if not self.config.quiet:
                     console(
                         f"  ⚠️ IMDB ID mismatch: {self.imdb_id} → {result.imdb_id}",
@@ -237,6 +287,16 @@ class MediaItem:
             "year": self.new_year or self.year,
             "title": self.new_title or self.title,
         }
+        if not self.config.no_cache:
+            save_cache(self.config.cache, set(self.config.cache.keys()))
+
+        # Check if IDs were updated during enrichment and a better (ID-based) cache key is now available.
+        new_cache_key = get_cache_key(self)
+        if new_cache_key != cache_key:
+            self.config.cache[new_cache_key] = self.config.cache.pop(cache_key)
+            if not self.config.no_cache:
+                save_cache(self.config.cache, set(self.config.cache.keys()))
+
         return True
 
     def needs_rename(self) -> bool:
@@ -290,17 +350,6 @@ def sleep_and_notify(func):
     return wrapper
 
 
-LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-log_path = os.path.join(LOG_DIR, "idarr.log")
-
-logger = logging.getLogger(__name__)
-
-logger.setLevel(logging.DEBUG)
-
-log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-
-
 class RemoveColorFilter(logging.Filter):
     ansi_escape = re.compile(r"\x1B[@-_][0-?]*[ -/]*[@-~]")
 
@@ -315,72 +364,6 @@ file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(log_formatter)
 file_handler.addFilter(RemoveColorFilter())
 logger.addHandler(file_handler)
-
-
-def sanitize_filename(name: str) -> str:
-    """
-    Sanitize a filename to be safe for most filesystems.
-    Removes or replaces unsafe characters.
-    Args:
-        name: The filename string to sanitize.
-    Returns:
-        Sanitized filename string.
-    """
-
-    normalized = unicodedata.normalize("NFKD", name).encode("ASCII", "ignore").decode()
-
-    cleaned = re.sub(r"[<>:\"/\\|?*]", "", normalized)
-
-    allowed = set(string.ascii_letters + string.digits + " -_.(){}")
-    sanitized = "".join(c for c in cleaned if c in allowed)
-
-    return sanitized.rstrip(" .")
-
-
-def generate_new_filename(media_item: "MediaItem", old_filename: str) -> str:
-    """
-    Given a MediaItem and its old filename (basename), return the new sanitized filename
-    with updated title, year, IDs, and season suffix.
-    Args:
-        media_item: The MediaItem instance.
-        old_filename: The original filename (basename).
-    Returns:
-        The new sanitized filename as a string.
-    """
-
-    old_name_no_ext = os.path.splitext(old_filename)[0]
-    base_title = media_item.new_title if media_item.new_title else (media_item.title if media_item.title else old_name_no_ext)
-    base_year = media_item.new_year if media_item.new_year is not None else media_item.year
-
-    id_parts = []
-    for attr, prefix in (("tmdb_id", "tmdb"), ("tvdb_id", "tvdb"), ("imdb_id", "imdb")):
-        val = getattr(media_item, f"new_{attr}", None)
-        if val is None:
-            val = getattr(media_item, attr, None)
-
-        if prefix == "imdb" and (not isinstance(val, str) or not val.startswith("tt")):
-            continue
-        if val:
-            id_parts.append(f"{prefix}-{val}")
-    suffix = "".join(f" {{{part}}}" for part in id_parts)
-
-    season_suffix = ""
-    match = SEASON_PATTERN.search(old_filename)
-    if match:
-        season_suffix = match.group(0)
-
-    name, ext = os.path.splitext(old_filename)
-
-    base = f"{base_title}{f' ({base_year})' if base_year else ''}"
-
-    if media_item.type == "tv_series":
-        new_name = f"{base}{suffix}{season_suffix}{ext}"
-    else:
-        new_name = f"{base}{season_suffix}{suffix}{ext}"
-
-    new_name = sanitize_filename(new_name)
-    new_name = " ".join(new_name.split()).strip()
-    return new_name
 
 
 def normalize_str(string: str) -> str:
@@ -520,13 +503,66 @@ def parse_file_group(config: SimpleNamespace, base_name: str, files: list[str]) 
     files = sorted([os.path.join(config.source_dir, file) for file in files if not file.startswith(".")])
     is_series = any(SEASON_PATTERN.search(file) for file in files)
     is_collection = not year
-    if is_collection:
+
+    # Determine type, preferring cached type if present
+    cache_type = None
+    tmp_media_item = None
+
+    # Generate a temporary MediaItem to get the cache_key
+    tmp_data = {
+        "type": "movie",  # placeholder, will fix below
+        "title": title,
+        "year": year,
+        "tmdb_id": tmdb_id,
+        "tvdb_id": tvdb_id,
+        "imdb_id": imdb_id,
+        "files": files,
+    }
+    # If a TMDB ID is present, search all possible type cache keys
+    cache_entry = None
+    cache_type = None
+    if tmdb_id is not None:
+        for possible_type in ("movie", "tv_series", "collection"):
+            tmp_data["type"] = possible_type
+            tmp_media_item = MediaItem(**tmp_data, config=config)
+            possible_cache = config.cache.get(get_cache_key(tmp_media_item))
+            if possible_cache:
+                cache_entry = possible_cache
+                cache_type = possible_cache.get("type")
+                break
+    else:
+        tmp_media_item = MediaItem(**tmp_data, config=config)
+        cache_entry = config.cache.get(get_cache_key(tmp_media_item))
+        if cache_entry:
+            cache_type = cache_entry.get("type")
+
+    if cache_type == "collection" or is_collection:
         data = create_collection(title, tmdb_id, imdb_id, files)
-    elif is_series:
+    elif cache_type == "tv_series" or is_series or tvdb_id:
         data = create_series(title, year, tvdb_id, imdb_id, tmdb_id, files)
     else:
         data = create_movie(title, year, tmdb_id, imdb_id, files)
-    return MediaItem(**data, config=config)
+    media_item = MediaItem(**data, config=config)
+    if cache_entry:
+        for field in ("tmdb_id", "tvdb_id", "imdb_id"):
+            val = cache_entry.get(field)
+            if val:
+                setattr(media_item, field, val)
+                new_field = f"new_{field}"
+                if not getattr(media_item, new_field, None):
+                    setattr(media_item, new_field, val)
+
+    # Pending matches override
+    title_key = f"{title} ({year})" if year else title
+    pending_url = getattr(config, "pending_matches", {}).get(title_key)
+    if pending_url and pending_url != "add_tmdb_url_here":
+        tmdb_id, typ = parse_tmdb_url(pending_url)
+        if not tmdb_id or not typ:
+            raise ValueError(f"Invalid TMDB URL in pending_matches.json for '{title_key}': {pending_url}")
+        media_item.tmdb_id = tmdb_id
+        media_item.type = typ
+
+    return media_item
 
 
 def scan_files_in_flat_folder(config: SimpleNamespace) -> list[MediaItem]:
@@ -581,129 +617,7 @@ def scan_files_in_flat_folder(config: SimpleNamespace) -> list[MediaItem]:
     return assets_dict
 
 
-def exact_match_shortcut(search_results: list[Any], search: MediaItem) -> Optional[Any]:
-    norm_search = normalize_with_aliases(search.title)
-    for res in search_results:
-        title = getattr(res, "title", getattr(res, "name", ""))
-        if normalize_with_aliases(title) == norm_search:
-            date = getattr(res, "release_date", getattr(res, "first_air_date", ""))
-            year = date.year if hasattr(date, "year") else (int(date[:4]) if isinstance(date, str) and date[:4].isdigit() else None)
-            if year == search.year:
-                return res
-    return None
-
-
-def alternate_titles_fallback(search_results: list[Any], search: MediaItem, media_type: str) -> Optional[Any]:
-    norm_search = normalize_with_aliases(search.title)
-    for res in search_results:
-        alt_list = getattr(res, "alternative_titles", [])
-        for alt in alt_list:
-            cand = alt.get("title") if isinstance(alt, dict) else str(alt)
-            if normalize_with_aliases(cand) == norm_search:
-                return res
-    return None
-
-
-def perform_tmdb_search(search: MediaItem, media_type: str) -> Optional[list[Any]]:
-    if media_type == "collection":
-        return TMDB_CLIENT.collection_search(query=search.title)
-    elif media_type == "movie":
-        return TMDB_CLIENT.movie_search(query=search.title, year=search.year)
-    elif media_type == "tv_series":
-        return TMDB_CLIENT.tv_search(query=search.title, first_air_date_year=search.year)
-    else:
-        msg = f"[SKIPPED] Unsupported media type '{media_type}' for '{search.title}'"
-        logger.info(msg)
-        return None
-
-
-def match_by_id(search_results: list[Any], search: MediaItem, media_type: str) -> Optional[Any]:
-    for res in search_results:
-        if (
-            (getattr(search, "tmdb_id", None) and getattr(res, "id", None) == search.tmdb_id)
-            or (getattr(search, "tvdb_id", None) and getattr(res, "tvdb_id", None) == search.tvdb_id)
-            or (getattr(search, "imdb_id", None) and getattr(res, "imdb_id", None) == search.imdb_id)
-        ):
-            return res
-    return None
-
-
-def match_by_original_title(search_results: list[Any], search: MediaItem, media_type: str) -> Optional[Any]:
-    for res in search_results:
-        orig_title = getattr(res, "original_title", None)
-        if orig_title and normalize_with_aliases(orig_title) == normalize_with_aliases(search.title):
-            header = "🎯 Original-title:"
-            msg = f"  → {orig_title} ({search.year}) [{getattr(res, 'id', None)}] [{media_type}]"
-            logger.info(header)
-            logger.info(msg)
-            console(header)
-            console(msg, "GREEN")
-            return res
-    return None
-
-
-def fuzzy_match_candidates(
-    search_results: list[Any],
-    search: MediaItem,
-    *,
-    strict: bool = True,
-    ratio_threshold: float = 0.95,
-    jaccard_threshold: float = 0.85,
-    year_tolerance: int = 0,
-) -> Any:
-    """
-    Perform fuzzy matching of search results against a MediaItem.
-    If strict=True, return a single high-confidence match or None.
-    If strict=False, return (candidates: list, scored: list of tuples).
-    Parameters:
-        search_results: List of candidate results to match.
-        search: MediaItem to match against.
-        strict: If True, requires high-confidence match using thresholds.
-        ratio_threshold: Minimum SequenceMatcher ratio required for strict match (default 0.95).
-        jaccard_threshold: Minimum word-level Jaccard similarity for strict match (default 0.85).
-        year_tolerance: Allowed difference in years for strict match (default 0, requires exact year).
-    """
-
-    def word_jaccard(a: str, b: str) -> float:
-        words_a = set(re.findall(r"\w+", a.lower()))
-        words_b = set(re.findall(r"\w+", b.lower()))
-        if not words_a or not words_b:
-            return 0.0
-        intersection = words_a & words_b
-        union = words_a | words_b
-        return len(intersection) / len(union)
-
-    norm_search = normalize_with_aliases(search.title)
-    candidates = []
-    scored = []
-    for res in search_results:
-        title = getattr(res, "title", getattr(res, "name", ""))
-        norm_res = normalize_with_aliases(title)
-        ratio = SequenceMatcher(None, norm_search, norm_res).ratio()
-        date = getattr(res, "release_date", getattr(res, "first_air_date", ""))
-        res_year = None
-        if isinstance(date, str) and date[:4].isdigit():
-            res_year = int(date[:4])
-        elif hasattr(date, "year"):
-            res_year = date.year
-        jaccard = word_jaccard(search.title, title)
-        y_score = 1.0 if res_year == search.year else 0.5 if res_year and search.year and abs(res_year - search.year) <= 1 else 0
-        score = ratio * 2 + y_score
-        scored.append((score, res))
-        if strict:
-            year_ok = (search.year is None and res_year is None) or (
-                res_year is not None and search.year is not None and abs(res_year - search.year) <= year_tolerance
-            )
-            if ratio >= ratio_threshold and jaccard >= jaccard_threshold and year_ok:
-                candidates.append(res)
-        else:
-            if score > 1.0:
-                candidates.append(res)
-    if strict:
-        return candidates[0] if len(candidates) == 1 else None
-    else:
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return candidates
+# ==== Helper functions for query_tmdb modularization ====
 
 
 def fetch_by_tmdb_id(search: "MediaItem", media_type: str) -> Optional[Any]:
@@ -772,51 +686,296 @@ def fetch_by_tmdb_id(search: "MediaItem", media_type: str) -> Optional[Any]:
     return None
 
 
+def fuzzy_match_candidates(
+    search_results: list[Any],
+    search: MediaItem,
+    *,
+    strict: bool = True,
+    ratio_threshold: float = 0.90,
+    jaccard_threshold: float = 0.85,
+    year_tolerance: int = 0,
+) -> Any:
+    """
+    Perform fuzzy matching of search results against a MediaItem.
+    If strict=True, return a single high-confidence match or None.
+    If strict=False, return (candidates: list, scored: list of tuples).
+    Parameters:
+        search_results: List of candidate results to match.
+        search: MediaItem to match against.
+        strict: If True, requires high-confidence match using thresholds.
+        ratio_threshold: Minimum SequenceMatcher ratio required for strict match (default 0.95).
+        jaccard_threshold: Minimum word-level Jaccard similarity for strict match (default 0.85).
+        year_tolerance: Allowed difference in years for strict match (default 0, requires exact year).
+    """
+
+    def word_jaccard(a: str, b: str) -> float:
+        words_a = set(re.findall(r"\w+", a.lower()))
+        words_b = set(re.findall(r"\w+", b.lower()))
+        if not words_a or not words_b:
+            return 0.0
+        intersection = words_a & words_b
+        union = words_a | words_b
+        return len(intersection) / len(union)
+
+    norm_search = normalize_with_aliases(search.title)
+    candidates = []
+    scored = []
+    for res in search_results:
+        title = getattr(res, "title", getattr(res, "name", ""))
+        norm_res = normalize_with_aliases(title)
+        ratio = SequenceMatcher(None, norm_search, norm_res).ratio()
+        date = getattr(res, "release_date", getattr(res, "first_air_date", ""))
+        res_year = None
+        if isinstance(date, str) and date[:4].isdigit():
+            res_year = int(date[:4])
+        elif hasattr(date, "year"):
+            res_year = date.year
+        jaccard = word_jaccard(norm_search, norm_res)
+        y_score = 1.0 if res_year == search.year else 0.5 if res_year and search.year and abs(res_year - search.year) <= 1 else 0
+        score = ratio * 2 + y_score
+        scored.append((score, res))
+        if strict:
+            year_ok = (search.year is None and res_year is None) or (
+                res_year is not None and search.year is not None and abs(res_year - search.year) <= year_tolerance
+            )
+            if ratio >= ratio_threshold and jaccard >= jaccard_threshold and year_ok:
+                candidates.append(res)
+            elif 0.0 <= ratio_threshold - ratio <= 0.05:
+                msg = f"📉 Near-match: '{title}' (Ratio: {ratio:.3f}, Jaccard: {jaccard:.3f}, Year: {res_year})"
+                logger.debug(msg)
+        else:
+            if score > 1.0:
+                candidates.append(res)
+    if strict:
+        return candidates[0] if len(candidates) == 1 else None
+    else:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return candidates
+
+
+def exact_match_shortcut(search_results: list[Any], search: MediaItem) -> Optional[Any]:
+    norm_search = normalize_with_aliases(search.title)
+    for res in search_results:
+        title = getattr(res, "title", getattr(res, "name", ""))
+        if normalize_with_aliases(title) == norm_search:
+            date = getattr(res, "release_date", getattr(res, "first_air_date", ""))
+            year = date.year if hasattr(date, "year") else (int(date[:4]) if isinstance(date, str) and date[:4].isdigit() else None)
+            if year == search.year:
+                return res
+    return None
+
+
+def alternate_titles_fallback(search_results: list[Any], search: MediaItem, media_type: str) -> Optional[Any]:
+    norm_search = normalize_with_aliases(search.title)
+    for res in search_results:
+        alt_list = getattr(res, "alternative_titles", [])
+        for alt in alt_list:
+            cand = alt.get("title") if isinstance(alt, dict) else str(alt)
+            if normalize_with_aliases(cand) == norm_search:
+                return res
+    return None
+
+
+def perform_tmdb_search(search: MediaItem, media_type: str) -> Optional[list[Any]]:
+    if media_type == "collection":
+        return TMDB_CLIENT.collection_search(query=search.title)
+    elif media_type == "movie":
+        return TMDB_CLIENT.movie_search(query=search.title, year=search.year)
+    elif media_type == "tv_series":
+        return TMDB_CLIENT.tv_search(query=search.title, first_air_date_year=search.year)
+    else:
+        msg = f"[SKIPPED] Unsupported media type '{media_type}' for '{search.title}'"
+        logger.info(msg)
+        return None
+
+
+def match_by_id(search_results: list[Any], search: MediaItem, media_type: str) -> Optional[Any]:
+    for res in search_results:
+        if (
+            (getattr(search, "tmdb_id", None) and getattr(res, "id", None) == search.tmdb_id)
+            or (getattr(search, "tvdb_id", None) and getattr(res, "tvdb_id", None) == search.tvdb_id)
+            or (getattr(search, "imdb_id", None) and getattr(res, "imdb_id", None) == search.imdb_id)
+        ):
+            return res
+    return None
+
+
+def match_by_original_title(search_results: list[Any], search: MediaItem, media_type: str) -> Optional[Any]:
+    for res in search_results:
+        orig_title = getattr(res, "original_title", None)
+        if orig_title and normalize_with_aliases(orig_title) == normalize_with_aliases(search.title):
+            return res
+    return None
+
+
+def _log_search_attempt(title, year, media_type, is_new_attempt):
+    if is_new_attempt:
+        msg = f"🔍 Searching TMDB for “{title}” ({year}) [{media_type}]..."
+        logger.info(msg)
+        console(msg)
+
+
+def _log_result(header, msg, color="GREEN"):
+    logger.info(header)
+    logger.info(msg)
+    console(header)
+    console(msg, color)
+
+
+def _try_id_lookup(search, media_type):
+    result = fetch_by_tmdb_id(search, media_type)
+    if result:
+        reason = search.match_reason or "id"
+        return result, reason
+    return None, None
+
+
+def _try_main_match(search_results, search, media_type):
+    # 1. ID match
+    id_match = match_by_id(search_results, search, media_type)
+    if id_match:
+        return id_match, "id"
+    # 2. Ambiguous check (same title+year)
+    exact_title = search.title.strip().lower()
+    same_title_year = []
+    for res in search_results:
+        title = getattr(res, "title", getattr(res, "name", "")).strip().lower()
+        date = getattr(res, "release_date", getattr(res, "first_air_date", ""))
+        year_val = date.year if hasattr(date, "year") else (int(date[:4]) if isinstance(date, str) and date[:4].isdigit() else None)
+        if title == exact_title and year_val == search.year:
+            same_title_year.append(res)
+    if len(same_title_year) > 1:
+        search.match_failed = True
+        search.match_reason = "ambiguous"
+        return None, "ambiguous"
+    # 3. Exact shortcut
+    shortcut = exact_match_shortcut(search_results, search)
+    if shortcut:
+        return shortcut, "exact"
+    # 4. Original title
+    orig_match = match_by_original_title(search_results, search, media_type)
+    if orig_match:
+        return orig_match, "original"
+    # 5. Alternate-title
+    alt = alternate_titles_fallback(search_results, search, media_type)
+    if alt:
+        return alt, "alternate"
+    # 6. Fuzzy
+    fuzzy = fuzzy_match_candidates(search_results, search, strict=True)
+    if fuzzy:
+        return fuzzy, "fuzzy_norm"
+    # 6. Fuzzy - wider year diff if search_results is 1 item
+    if len(search_results) == 1:
+        fuzzy = fuzzy_match_candidates(
+            search_results, search, strict=True, ratio_threshold=0.9, jaccard_threshold=0.85, year_tolerance=2
+        )
+        if fuzzy:
+            return fuzzy, "fuzzy_year_diff"
+    # 7. Fuzzy alternate
+    alt_candidates = []
+    for res in search_results:
+        alt_list = getattr(res, "alternative_titles", [])
+        for alt in alt_list:
+            alt_title = alt.get("title") if isinstance(alt, dict) else str(alt)
+            alt_candidates.append(SimpleNamespace(title=alt_title, _orig_res=res))
+    fuzzy_alt = None
+    if alt_candidates:
+        fuzzy_alt_result = fuzzy_match_candidates(alt_candidates, search, strict=True)
+        if fuzzy_alt_result:
+            fuzzy_alt = getattr(fuzzy_alt_result, "_orig_res", None)
+    if fuzzy_alt:
+        return fuzzy_alt, "fuzzy_alternate"
+    return None, None
+
+
+def _try_transformations(search_results, search, media_type):
+    transformations = [
+        (lambda s: unidecode(s), lambda s: any(ord(c) > 127 for c in s)),
+        (lambda s: s.replace("_", " "), lambda s: "_" in s),
+        (lambda s: s.replace("-", " "), lambda s: "-" in s),
+        (lambda s: s.replace("_", ":"), lambda s: "_" in s),
+        (lambda s: s.replace("-", ":"), lambda s: "-" in s),
+        (lambda s: s.replace("-", "\\"), lambda s: "-" in s),
+        (lambda s: s.replace("+", "\\"), lambda s: "+" in s),
+    ]
+    for transform, predicate in transformations:
+        if predicate(search.title):
+            alt_title = transform(search.title)
+            if alt_title != search.title:
+                temp_search = MediaItem(
+                    config=search.config,
+                    type=search.type,
+                    title=alt_title,
+                    year=search.year,
+                    tmdb_id=search.tmdb_id,
+                    tvdb_id=search.tvdb_id,
+                    imdb_id=search.imdb_id,
+                    files=search.files,
+                )
+                # If we have no search results, try a new TMDB search with the transformed title
+                try:
+                    if not search_results:
+                        alt_results = perform_tmdb_search(temp_search, media_type) or []
+                    else:
+                        alt_results = search_results
+                except Exception as e:
+                    logger.warning(f"🔁 Transformation search failed for '{alt_title}': {e}")
+                    continue
+                shortcut = exact_match_shortcut(alt_results, temp_search)
+                if shortcut:
+                    return shortcut, "exact_transform"
+                orig_match = match_by_original_title(alt_results, temp_search, media_type)
+                if orig_match:
+                    return orig_match, "original_transform"
+                alt = alternate_titles_fallback(alt_results, temp_search, media_type)
+                if alt:
+                    return alt, "alternate_transform"
+                fuzzy = fuzzy_match_candidates(alt_results, temp_search, strict=True)
+                if fuzzy:
+                    return fuzzy, "fuzzy_transform"
+                alt_candidates = []
+                for res in alt_results:
+                    alt_list = getattr(res, "alternative_titles", [])
+                    for alt in alt_list:
+                        alt_title2 = alt.get("title") if isinstance(alt, dict) else str(alt)
+                        alt_candidates.append(SimpleNamespace(title=alt_title2, _orig_res=res))
+                if alt_candidates:
+                    fuzzy_alt_result = fuzzy_match_candidates(alt_candidates, temp_search, strict=True)
+                    if fuzzy_alt_result:
+                        fuzzy_alt = getattr(fuzzy_alt_result, "_orig_res", None)
+                        if fuzzy_alt:
+                            return fuzzy_alt, "fuzzy_alternate_transform"
+    return None, None
+
+
 @sleep_and_notify
 @limits(calls=38, period=10)
-def query_tmdb(search: MediaItem, media_type: str, retry: bool = False, retry_unidecode: bool = False) -> Optional[Any]:
-    """
-    Query TMDB for a given media item, attempting to find the best match using a series of matching strategies.
-    Steps are clearly marked for clarity and maintainability.
-    """
-    orig_title = search.title
-    selected_id = None
+def query_tmdb(search: MediaItem, media_type: str, retry: bool = False, retry_unidecode: bool = False, tried=None) -> Optional[Any]:
+    if tried is None:
+        tried = set()
+    key = (search.title, search.year, media_type)
+    is_new_attempt = key not in tried
+    if not is_new_attempt:
+        return None
+    tried.add(key)
+    _log_search_attempt(search.title, search.year, media_type, is_new_attempt)
+
     try:
-        # === Step 0: Initialize search ===
-        logger.info(f"🔍 Searching TMDB for “{search.title}” ({search.year}) [{media_type}]...")
-        console(f"🔍 Searching TMDB for “{search.title}” ({search.year}) [{media_type}]...")
-
-        search_results = None
-        # === Step 1a: Lookup by TMDB ID (Direct Detail Fetch) ===
+        # === Step 1: Direct TMDB ID Lookup ===
         if getattr(search, "tmdb_id", None):
-            result = fetch_by_tmdb_id(search, media_type)
+            result, reason = _try_id_lookup(search, media_type)
             if result:
-                title_str = getattr(result, "title", getattr(result, "name", getattr(result, "original_title", "")))
-                res_id = getattr(result, "id", None)
-                reason = search.match_reason or "id"
-                header = "🎯 TMDB ID exact match:" if reason == "id_exact" else "🎯 TMDB ID fuzzy match:"
-                media_disp = getattr(result, "media_type", media_type)
-                msg = f"  → “{title_str}” ({search.year}) [{res_id}] [{media_disp}]"
-                logger.info(header)
-                logger.info(msg)
-                console(header)
-                console(msg, "GREEN")
+                _log_result(
+                    f"🎯 TMDB ID {reason} match:",
+                    f"  → {getattr(result, 'title', getattr(result, 'name', ''))} ({search.year}) [{getattr(result, 'id', None)}] [{media_type}]",
+                )
+                search.match_reason = reason
                 return result
-            # If mismatch, handle logging here as needed
-            if getattr(search, "match_reason", "") == "id data mismatch":
-                warn_msg = f"⚠️ Inconsistent TMDB listing vs detail for ID {getattr(search, 'tmdb_id', None)}."
-                logger.warning(warn_msg)
-                console(warn_msg, "YELLOW")
-                return None
 
-        # === Step 1b: Search TMDB by title and type ===
-        search_results = perform_tmdb_search(search, media_type)
-        if not search_results:
-            search_results = []
-
-        # === Step 2: Debug raw search results ===
+        # === Step 2: Main TMDB Search ===
+        search_results = perform_tmdb_search(search, media_type) or []
         if LOG_LEVEL == "DEBUG" and search_results:
-            console(f"[DEBUG] Raw search results for “{orig_title}” [{media_type}]:", "BLUE")
+            console(f"[DEBUG] Raw search results for “{search.title}” [{media_type}]:", "BLUE")
             for idx, res in enumerate(search_results, start=1):
                 title = getattr(
                     res,
@@ -828,228 +987,104 @@ def query_tmdb(search: MediaItem, media_type: str, retry: bool = False, retry_un
                     date.year if hasattr(date, "year") else (date[:4] if isinstance(date, str) and len(date) >= 4 else "None")
                 )
                 line = f"  {idx}. id={getattr(res,'id',None)}, title=\"{title}\", year={year_val}"
-                if getattr(res, "id", None) == selected_id:
-                    console(line, "GREEN")
-                    logger.debug(line)
-                else:
-                    console(line, "WHITE")
-                    logger.debug(line)
+                console(line, "WHITE")
+                logger.debug(line)
 
-        # === Step 3: ID-based match in search results ===
-        id_match = match_by_id(search_results, search, media_type)
-        if id_match:
-            header = "🎯 ID-based match:"
-            msg = (
-                f"  → {getattr(res, 'title', getattr(res, 'name', ''))} ({search.year}) [{getattr(res, 'id', None)}] [{media_type}]"
-            )
-            logger.info(header)
-            logger.info(msg)
-            console(header)
-            console(msg, "GREEN")
-            search.match_reason = "id"
-            return id_match
-
-        exact_title = search.title.strip().lower()
-        same_title_year = []
-        for res in search_results:
-            title = getattr(res, "title", getattr(res, "name", "")).strip().lower()
-            date = getattr(res, "release_date", getattr(res, "first_air_date", ""))
-            year_val = (
-                date.year if hasattr(date, "year") else (int(date[:4]) if isinstance(date, str) and date[:4].isdigit() else None)
-            )
-            if title == exact_title and year_val == search.year:
-                same_title_year.append(res)
-
-        if len(same_title_year) > 1:
-            logger.warning(
-                f"⚠️ Ambiguous results: Multiple results found with the same title and year for “{search.title}” ({search.year})"
-            )
-            console(
-                f"⚠️ Ambiguous results for “{search.title}” ({search.year}) — skipping match",
-                "YELLOW",
-            )
+        result, reason = _try_main_match(search_results, search, media_type)
+        if reason == "ambiguous":
+            msg = f"🤷 Ambiguous result for “{search.title}” ({search.year}) [{media_type}] — Multiple possible matches found."
+            logger.warning(msg)
+            console(msg, "YELLOW")
             search.match_failed = True
-            search.match_reason = "ambiguous"
+            search.match_reason = search.match_reason or "ambiguous"
             return None
+        if result:
+            year_val = search.year
+            if hasattr(result, "release_date") or hasattr(result, "first_air_date"):
+                date_val = getattr(result, "release_date", getattr(result, "first_air_date", None))
+                if isinstance(date_val, str) and date_val[:4].isdigit():
+                    year_val = int(date_val[:4])
+                elif hasattr(date_val, "year"):
+                    year_val = date_val.year
+            _log_result(
+                f"🎯 {reason} match:",
+                f"  → {getattr(result, 'title', getattr(result, 'name', ''))} ({year_val}) [{getattr(result, 'id', None)}] [{media_type}]",
+            )
+            search.match_reason = reason
+            return result
 
-        # === Step 4: Exact title-year shortcut match ===
-        shortcut = exact_match_shortcut(search_results, search)
-        if shortcut:
-            header = "🎯 Exact match:"
-            msg = f"  → “{search.title}” ({search.year}) [{getattr(shortcut, 'id', None)}] [{media_type}]"
-            logger.info(header)
-            logger.info(msg)
-            console(header)
-            console(msg, "GREEN")
-            selected_id = getattr(shortcut, "id", None)
-            search.match_reason = "exact"
-            return shortcut
-
-        # === Step 5: Original title fallback match ===
-        orig_match = match_by_original_title(search_results, search, media_type)
-        if orig_match:
-            search.match_reason = "original"
-            return orig_match
-
-        # === Step 6: Alternate-title exact match ===
-        alt = alternate_titles_fallback(search_results, search, media_type)
-        if alt:
-            title_str = getattr(alt, "title", getattr(alt, "name", ""))
-            header = "🔄 Alternate-title match:"
-            msg = f"  → {title_str} ({search.year}) [{getattr(alt, 'id', None)}] [{media_type}]"
-            logger.info(header)
-            logger.info(msg)
-            console(header)
-            console(msg, "GREEN")
-            search.match_reason = "alternate"
-            return alt
-
-        # === Step 7: High-confidence fuzzy title match ===
-        fuzzy = fuzzy_match_candidates(search_results, search, strict=True)
-        if fuzzy:
-            title_str = getattr(fuzzy, "title", getattr(fuzzy, "name", ""))
-            header = "🎯 High-confidence fuzzy match:"
-            msg = f"  → {title_str} ({search.year}) [{getattr(fuzzy, 'id', None)}] [{media_type}]"
-            logger.info(header)
-            logger.info(msg)
-            console(header)
-            console(msg, "GREEN")
-            search.match_reason = "fuzzy"
-            return fuzzy
-
-        # === Step 8: Fuzzy matching against alternate titles ===
-        alt_candidates = []
-        for res in search_results:
-            alt_list = getattr(res, "alternative_titles", [])
-            for alt in alt_list:
-                alt_title = alt.get("title") if isinstance(alt, dict) else str(alt)
-                alt_candidates.append(SimpleNamespace(title=alt_title, _orig_res=res))
-
-        fuzzy_alt = None
-        if alt_candidates:
-            fuzzy_alt_result = fuzzy_match_candidates(alt_candidates, search, strict=True)
-            if fuzzy_alt_result:
-                fuzzy_alt = getattr(fuzzy_alt_result, "_orig_res", None)
-
-        if fuzzy_alt:
-            title_str = getattr(fuzzy_alt, "title", getattr(fuzzy_alt, "name", ""))
-            header = "🎯 Fuzzy alternate-title match:"
-            msg = f"  → {title_str} ({search.year}) [{getattr(fuzzy_alt, 'id', None)}] [{media_type}]"
-            logger.info(header)
-            logger.info(msg)
-            console(header)
-            console(msg, "GREEN")
-            search.match_reason = "fuzzy_alternate"
-            return fuzzy_alt
-
-        # === Step 9: Final single-result fallback ===
-        if retry and search.year is None and len(search_results) == 1:
-            candidate = search_results[0]
-            title = getattr(candidate, "title", getattr(candidate, "name", ""))
-            norm_input = normalize_str(search.title)
-            norm_candidate = normalize_str(title)
-            ratio = SequenceMatcher(None, norm_input, norm_candidate).ratio()
-            if ratio >= 0.95:
-                msg = f"🟡 Final fallback accepted single result: {title} [id={getattr(candidate, 'id', '?')}] [{media_type}]"
-                console(msg, "YELLOW")
-                logger.warning(msg)
-                search.match_reason = "fallback_single"
-                return candidate
-
-        # === Step 10: Retry as TV series fallback ===
-        if media_type == "movie":
-            logger.info(f"🔄 No confident match as movie; retrying as TV series for “{search.title}”")
-            console(f"🔄 Retrying as TV series: “{search.title}”", "YELLOW")
-            tv_result = query_tmdb(search, "tv_series", retry=retry, retry_unidecode=retry_unidecode)
-            if tv_result:
-                RECLASSIFIED.append(
-                    {
-                        "original_type": "movie",
-                        "new_type": "tv_series",
-                        "title": search.title,
-                        "year": search.year,
-                        "matched_id": getattr(tv_result, "id", None),
-                        "file": (os.path.basename(search.files[0]) if hasattr(search, "files") and search.files else None),
-                    }
+        # === Step 4: Transformations ===
+        if not retry and search_results:
+            result, reason = _try_transformations(search_results, search, media_type)
+            if result:
+                year_val = search.year
+                if hasattr(result, "release_date") or hasattr(result, "first_air_date"):
+                    date_val = getattr(result, "release_date", getattr(result, "first_air_date", None))
+                    if isinstance(date_val, str) and date_val[:4].isdigit():
+                        year_val = int(date_val[:4])
+                    elif hasattr(date_val, "year"):
+                        year_val = date_val.year
+                _log_result(
+                    f"🎯 {reason} match:",
+                    f"  → {getattr(result, 'title', getattr(result, 'name', ''))} ({year_val}) [{getattr(result, 'id', None)}] [{media_type}]",
                 )
+                search.match_reason = reason
+                return result
+
+        # === Step 3: Fallbacks ===
+        if media_type == "movie":
+            if is_new_attempt:
+                logger.info(f"🔄 No confident match as movie; retrying as TV series for “{search.title}”")
+                console(f"🔄 Retrying as TV series: “{search.title}”", "YELLOW")
+            tv_result = query_tmdb(search, "tv_series", retry=retry, retry_unidecode=retry_unidecode, tried=tried)
+            if tv_result:
                 search.type = "tv_series"
-                selected_id = getattr(tv_result, "id", None)
                 return tv_result
 
         msg = f"🤷 No confident match found for “{search.title}” ({search.year})"
-        console(msg)
         logger.warning(msg)
+        console(msg)
+        search.match_failed = True
+        if not getattr(search, "match_reason", None):
+            search.match_reason = "no_match"
         return None
 
-    except ConnectionError as ce:
-        console(f"[ERROR] Connection failed for '{search.title}': {ce}", "RED")
-        logger.error(f" Connection failed for '{search.title}': {ce}")
     except Exception as e:
+        # Guard: if ambiguous was set, never trigger fallback logic
+        if getattr(search, "match_reason", None) == "ambiguous":
+            search.match_failed = True
+            search.match_reason = search.match_reason or "ambiguous"
+            # Safety: never retry fallbacks if ambiguous found
+            return None
         console(
-            f"[WARNING] Failed to query TMDB for '{orig_title}' ({search.year}) as {media_type}: {e}",
+            f"[WARNING] Failed to query TMDB for '{search.title}' ({search.year}) as {media_type}: {e}",
             "YELLOW",
         )
-        logger.warning(f"Failed to query TMDB for '{orig_title}' ({search.year}) as {media_type}: {e}")
+        logger.warning(f"Failed to query TMDB for '{search.title}' ({search.year}) as {media_type}: {e}")
 
         if "No Results Found" in str(e):
-            # === Step 11a: Retry with unaccented title ===
-            if not retry_unidecode:
-                unaccented = unidecode(orig_title)
-                if unaccented != orig_title:
-                    console(
-                        f"[WARNING] 🔁 Retrying TMDB search with unaccented title: '{unaccented}'",
-                        "YELLOW",
-                    )
-                    logger.warning(f"🔁 Retrying with unaccented title: '{unaccented}'")
-                    search.title = unaccented
-                    return query_tmdb(search, media_type, retry=retry, retry_unidecode=True)
-
-            # === Step 11b: Retry without underscores ===
-            if not retry and "_" in orig_title:
-                alt_title = orig_title.replace("_", " ")
-                console(
-                    f"[WARNING] 🔁 Retrying TMDB search with out underscores: '{alt_title}'",
-                    "YELLOW",
+            result, reason = _try_transformations([], search, media_type)
+            if result:
+                _log_result(
+                    f"🎯 {reason} match:",
+                    f"  → {getattr(result, 'title', getattr(result, 'name', ''))} ({search.year}) [{getattr(result, 'id', None)}] [{media_type}]",
                 )
-                logger.warning(f"🔁 Retrying with spaces: '{alt_title}'")
-                search.title = alt_title
-                return query_tmdb(search, media_type, retry=True, retry_unidecode=retry_unidecode)
-
-            # === Step 11c: Retry without hyphens ===
-            if not retry and "-" in orig_title:
-                alt_title = orig_title.replace("-", " ")
-                console(
-                    f"[WARNING] 🔁 Retrying TMDB search without hyphens: '{alt_title}'",
-                    "YELLOW",
-                )
-                logger.warning(f"🔁 Retrying with spaces: '{alt_title}'")
-                search.title = alt_title
-                return query_tmdb(search, media_type, retry=True, retry_unidecode=retry_unidecode)
+                search.match_reason = reason
+                return result
 
             if media_type == "movie" and hasattr(search, "files") and len(search.files) == 1:
                 logger.info(f"🔄 Movie lookup failed; retrying as TV series for single-file “{search.title}”")
                 console(f"🔄 Retrying as TV series: “{search.title}”", "YELLOW")
-                tv_result = query_tmdb(search, "tv_series")
+                tv_result = query_tmdb(search, "tv_series", tried=tried)
                 if tv_result:
-                    RECLASSIFIED.append(
-                        {
-                            "original_type": "movie",
-                            "new_type": "tv_series",
-                            "title": search.title,
-                            "year": search.year,
-                            "matched_id": getattr(tv_result, "id", None),
-                            "file": os.path.basename(search.files[0]),
-                        }
-                    )
                     search.type = "tv_series"
-                    selected_id = getattr(tv_result, "id", None)
                     return tv_result
 
             if media_type in ("movie", "tv_series") and not retry:
                 logger.warning(f"🔁 Final fallback: retrying TMDB search with no year for “{search.title}”")
                 console(f"🔁 Final fallback: retrying TMDB search with no year", "YELLOW")
                 search.year = None
-                return query_tmdb(search, media_type, retry=True, retry_unidecode=retry_unidecode)
+                return query_tmdb(search, media_type, retry=True, retry_unidecode=retry_unidecode, tried=tried)
 
 
 def handle_data(config, items: list[MediaItem]) -> list[MediaItem]:
@@ -1066,7 +1101,14 @@ def handle_data(config, items: list[MediaItem]) -> list[MediaItem]:
     progress = None
     if config.quiet:
         progress = tqdm(total=len(items), desc="🔍 Enriching metadata", unit="item")
+
+    # Load pending matches
+    pending_matches = getattr(config, "pending_matches", {}).copy()
+
     for item in items:
+        if getattr(config, "skip_collections", False) and getattr(item, "type", None) == "collection":
+            logger.info(f"⏭️  Skipped collection: {item.title}")
+            continue
         enriched = item.enrich()
         if config.quiet and progress is not None:
             progress.update(1)
@@ -1076,7 +1118,7 @@ def handle_data(config, items: list[MediaItem]) -> list[MediaItem]:
                 {
                     "media_type": item.type,
                     "title": item.title,
-                    "year": item.year,
+                    "year": item.year if item.year is not None else "",
                     "tmdb_id": getattr(item, "tmdb_id", ""),
                     "tvdb_id": getattr(item, "tvdb_id", ""),
                     "imdb_id": getattr(item, "imdb_id", ""),
@@ -1084,7 +1126,15 @@ def handle_data(config, items: list[MediaItem]) -> list[MediaItem]:
                     "match_reason": getattr(item, "match_reason", ""),
                 }
             )
+            # Add to pending_matches if not present
+            title_key = f"{item.title} ({item.year})" if item.year else item.title
+            if title_key not in pending_matches:
+                pending_matches[title_key] = "add_tmdb_url_here"
             continue
+        # After enrichment, if item has a TMDB ID and is in pending_matches, remove it
+        title_key = f"{item.title} ({item.year})" if item.year else item.title
+        if getattr(item, "tmdb_id", None) and title_key in pending_matches:
+            del pending_matches[title_key]
         if item.type == "tv_series":
             has_tvdb = getattr(item, "tvdb_id", None) or getattr(item, "new_tvdb_id", None)
             if not has_tvdb:
@@ -1097,6 +1147,9 @@ def handle_data(config, items: list[MediaItem]) -> list[MediaItem]:
                         "files": ";".join(item.files),
                     }
                 )
+    # Save pending matches at the end
+    save_pending_matches(pending_matches)
+
     if config.quiet and config.show_unmatched and UNMATCHED_CASES:
         for case in UNMATCHED_CASES:
             title = case.get("title", "Unknown")
@@ -1106,6 +1159,72 @@ def handle_data(config, items: list[MediaItem]) -> list[MediaItem]:
     print("✅ Completed metadata enrichment")
     logger.info("✅ Completed metadata enrichment")
     return items
+
+
+def sanitize_filename(name: str) -> str:
+    """
+    Sanitize a filename to be safe for most filesystems.
+    Removes or replaces unsafe characters.
+    Args:
+        name: The filename string to sanitize.
+    Returns:
+        Sanitized filename string.
+    """
+
+    normalized = unicodedata.normalize("NFKD", name).encode("ASCII", "ignore").decode()
+
+    cleaned = re.sub(r"[<>:\"/\\|?*]", "", normalized)
+
+    allowed = set(string.ascii_letters + string.digits + r" !#$%&'()+,-.;=@[]^_`{}~")
+    sanitized = "".join(c for c in cleaned if c in allowed)
+
+    return sanitized.rstrip(" .")
+
+
+def generate_new_filename(media_item: "MediaItem", old_filename: str) -> str:
+    """
+    Given a MediaItem and its old filename (basename), return the new sanitized filename
+    with updated title, year, IDs, and season suffix.
+    Args:
+        media_item: The MediaItem instance.
+        old_filename: The original filename (basename).
+    Returns:
+        The new sanitized filename as a string.
+    """
+
+    old_name_no_ext = os.path.splitext(old_filename)[0]
+    base_title = media_item.new_title if media_item.new_title else (media_item.title if media_item.title else old_name_no_ext)
+    base_year = media_item.new_year if media_item.new_year is not None else media_item.year
+
+    id_parts = []
+    for attr, prefix in (("tmdb_id", "tmdb"), ("tvdb_id", "tvdb"), ("imdb_id", "imdb")):
+        val = getattr(media_item, f"new_{attr}", None)
+        if val is None:
+            val = getattr(media_item, attr, None)
+
+        if prefix == "imdb" and (not isinstance(val, str) or not val.startswith("tt")):
+            continue
+        if val:
+            id_parts.append(f"{prefix}-{val}")
+    suffix = "".join(f" {{{part}}}" for part in id_parts)
+
+    season_suffix = ""
+    match = SEASON_PATTERN.search(old_filename)
+    if match:
+        season_suffix = match.group(0)
+
+    name, ext = os.path.splitext(old_filename)
+
+    base = f"{base_title}{f' ({base_year})' if base_year else ''}"
+
+    if media_item.type == "tv_series":
+        new_name = f"{base}{suffix}{season_suffix}{ext}"
+    else:
+        new_name = f"{base}{season_suffix}{suffix}{ext}"
+
+    new_name = sanitize_filename(new_name)
+    new_name = " ".join(new_name.split()).strip()
+    return new_name
 
 
 def rename_files(items: list[MediaItem], config) -> tuple:
@@ -1274,33 +1393,6 @@ def rename_files(items: list[MediaItem], config) -> tuple:
     return file_updates, duplicate_log
 
 
-def export_duplicate_log_csv(duplicate_log: list) -> None:
-    if not duplicate_log:
-        return
-    column_order = [
-        "action",
-        "kept_file",
-        "kept_path",
-        "kept_ctime",
-        "moved_file",
-        "moved_path",
-        "moved_ctime",
-    ]
-
-    all_keys = set()
-    for entry in duplicate_log:
-        all_keys.update(entry.keys())
-    extra_keys = sorted([k for k in all_keys if k not in column_order])
-    final_fieldnames = column_order + extra_keys
-    duplicates_csv_path = os.path.join(LOG_DIR, "duplicates_log.csv")
-    with open(duplicates_csv_path, "w", newline="") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=final_fieldnames)
-        writer.writeheader()
-        for row in duplicate_log:
-            writer.writerow(row)
-    logger.info(f"🗂️ Duplicates conflict log written to {duplicates_csv_path}")
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Enrich and rename media image files using TMDB metadata.",
@@ -1388,6 +1480,11 @@ def parse_args():
         type=str,
         help="Only include items with a specific ID (tmdb-123, tvdb-456, imdb-tt1234567)",
     )
+    filtering.add_argument(
+        '--skip-collections',
+        action='store_true',
+        help='Skip enriching items identified as collections'
+    )
 
     extra = parser.add_argument_group("Export & Recovery")
     extra.add_argument(
@@ -1429,6 +1526,7 @@ def load_runtime_config(args) -> SimpleNamespace:
     config.id = getattr(args, "id", None)
     config.show_unmatched = getattr(args, "show_unmatched", False)
     config.revert = getattr(args, "revert", False)
+    config.skip_collections = getattr(args, "skip_collections", False)
 
     if config.no_cache:
         config.cache = {}
@@ -1438,6 +1536,8 @@ def load_runtime_config(args) -> SimpleNamespace:
         if os.path.exists(config.cache_path):
             os.remove(config.cache_path)
         config.cache = {}
+    # Load pending matches
+    config.pending_matches = load_pending_matches()
     if not config.tmdb_api_key:
         raise RuntimeError("TMDB API key is required. Set via --tmdb-api-key or TMDB_API_KEY environment variable.")
     TMDB_CLIENT = TMDbAPIs(config.tmdb_api_key)
@@ -1543,9 +1643,23 @@ def filter_items(args, items: list[MediaItem]) -> list[MediaItem]:
     return items
 
 
-def export_csvs(updated_items: list[MediaItem], file_updates: list) -> None:
-    csv_path = os.path.join(LOG_DIR, "updated_files.csv")
-    column_order = [
+def export_csvs(updated_items: list, file_updates: list, duplicate_log: list) -> None:
+    """Export all CSVs (updated_files, unmatched_cases, duplicates_log) with shared logic."""
+
+    def write_csv(path, rows, fieldnames):
+        if not rows:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        logger.info(f"CSV written to {path}")
+        console(f"⚙️ CSV written to {path}")
+
+    # Updated Files CSV
+    updated_files_path = os.path.join(LOG_DIR, "updated_files.csv")
+    updated_files_fieldnames = [
         "media_type",
         "original_filename",
         "new_filename",
@@ -1561,8 +1675,7 @@ def export_csvs(updated_items: list[MediaItem], file_updates: list) -> None:
         "new_imdb_id",
         "match_reason",
     ]
-
-    all_keys = set(column_order)
+    updated_rows = []
     for media_type, old_fn, new_fn in file_updates:
         matched = next(
             (
@@ -1572,92 +1685,81 @@ def export_csvs(updated_items: list[MediaItem], file_updates: list) -> None:
             ),
             None,
         )
-        if matched:
-            all_keys.update(vars(matched).keys())
-    extra_keys = sorted([k for k in all_keys if k not in column_order])
-    final_fieldnames = column_order + extra_keys
+        row = {
+            "media_type": media_type,
+            "original_filename": os.path.basename(old_fn),
+            "new_filename": os.path.basename(new_fn),
+            "original_title": getattr(matched, "title", ""),
+            "new_title": getattr(matched, "new_title", ""),
+            "original_year": getattr(matched, "year", ""),
+            "new_year": getattr(matched, "new_year", ""),
+            "tmdb_id": getattr(matched, "tmdb_id", ""),
+            "new_tmdb_id": getattr(matched, "new_tmdb_id", ""),
+            "tvdb_id": getattr(matched, "tvdb_id", ""),
+            "new_tvdb_id": getattr(matched, "new_tvdb_id", ""),
+            "imdb_id": getattr(matched, "imdb_id", ""),
+            "new_imdb_id": getattr(matched, "new_imdb_id", ""),
+            "match_reason": getattr(matched, "match_reason", ""),
+        }
+        updated_rows.append(row)
+    write_csv(updated_files_path, updated_rows, updated_files_fieldnames)
 
-    with open(csv_path, "w", newline="") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=final_fieldnames)
-        writer.writeheader()
-        for media_type, old_fn, new_fn in file_updates:
-            matched = next(
-                (
-                    item
-                    for item in updated_items
-                    if item.type == media_type and any(os.path.basename(fp) == old_fn for fp in item.files)
-                ),
-                None,
-            )
-            row = {
-                "media_type": media_type,
-                "original_filename": os.path.basename(old_fn),
-                "new_filename": os.path.basename(new_fn),
-                "original_title": getattr(matched, "title", ""),
-                "new_title": getattr(matched, "new_title", ""),
-                "original_year": getattr(matched, "year", ""),
-                "new_year": getattr(matched, "new_year", ""),
-                "tmdb_id": getattr(matched, "tmdb_id", ""),
-                "new_tmdb_id": getattr(matched, "new_tmdb_id", ""),
-                "tvdb_id": getattr(matched, "tvdb_id", ""),
-                "new_tvdb_id": getattr(matched, "new_tvdb_id", ""),
-                "imdb_id": getattr(matched, "imdb_id", ""),
-                "new_imdb_id": getattr(matched, "new_imdb_id", ""),
-                "match_reason": getattr(matched, "match_reason", ""),
-            }
-
-            if matched:
-                for k in extra_keys:
-                    row[k] = getattr(matched, k, "")
-            writer.writerow(row)
-    console(f"⚙️ Updated files CSV written to {csv_path}")
-    logger.info(f"Updated files CSV written to {csv_path}")
-
-
-def export_unmatched_cases_csv():
-    if not UNMATCHED_CASES:
-        return
-    column_order = [
-        "files",
-        "title",
-        "year",
-        "media_type",
-        "tmdb_id",
-        "imdb_id",
-        "tvdb_id",
-        "match_reason",
-    ]
-
+    # Unmatched Cases CSV
+    unmatched_cases_path = os.path.join(LOG_DIR, "unmatched_cases.csv")
+    unmatched_fieldnames = ["files", "title", "year", "media_type", "tmdb_id", "imdb_id", "tvdb_id", "match_reason"]
+    # Dynamically extend fields if there are extras
     all_keys = set()
     for case in UNMATCHED_CASES:
         all_keys.update(case.keys())
+    unmatched_extra = [k for k in sorted(all_keys) if k not in unmatched_fieldnames]
+    final_unmatched_fieldnames = unmatched_fieldnames + unmatched_extra
 
-    extra_keys = sorted([k for k in all_keys if k not in column_order])
-    final_fieldnames = column_order + extra_keys
+    unmatched_rows = []
+    for case in UNMATCHED_CASES:
+        row = dict(case)
+        if "files" in row:
+            files = row["files"]
+            if isinstance(files, str):
+                files = [f for f in files.split(";") if f]
+            elif not isinstance(files, list):
+                files = []
+            row["files"] = ";".join(os.path.basename(f) for f in files)
+        unmatched_rows.append(row)
+    write_csv(unmatched_cases_path, unmatched_rows, final_unmatched_fieldnames)
 
-    unmatched_csv_path = os.path.join(LOG_DIR, "unmatched_cases.csv")
-    with open(unmatched_csv_path, "w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=final_fieldnames)
-        writer.writeheader()
-        for case in UNMATCHED_CASES:
-            row = dict(case)
+    # Duplicate Log CSV
+    duplicates_csv_path = os.path.join(LOG_DIR, "duplicates_log.csv")
+    duplicate_fieldnames = ["action", "kept_file", "kept_path", "kept_ctime", "moved_file", "moved_path", "moved_ctime"]
+    # Add any extras found in duplicate_log entries
+    all_dupe_keys = set()
+    for entry in duplicate_log:
+        all_dupe_keys.update(entry.keys())
+    extra_dupe = [k for k in sorted(all_dupe_keys) if k not in duplicate_fieldnames]
+    final_duplicate_fieldnames = duplicate_fieldnames + extra_dupe
 
-            if "title" in row:
-                title = row.get("title", "")
-                year = row.get("year", None)
-                if year:
-                    row["title"] = f"{title} ({year})"
-            if "files" in row:
-                files = row["files"]
-                if isinstance(files, str):
-                    files = [f for f in files.split(";") if f]
-                elif not isinstance(files, list):
-                    files = []
-                row["files"] = ";".join(os.path.basename(f) for f in files)
-            writer.writerow(row)
-    msg = f"⚠️ Unmatched cases CSV exported to {unmatched_csv_path}"
-    console(msg, "YELLOW")
-    logger.info(msg)
+    write_csv(duplicates_csv_path, duplicate_log, final_duplicate_fieldnames)
+
+    # TVDB Missing Cases CSV
+    tvdb_missing_path = os.path.join(LOG_DIR, "tvdb_missing_cases.csv")
+    tvdb_missing_fieldnames = ["title", "year", "tmdb_id", "imdb_id", "files"]
+    all_tvdb_keys = set()
+    for entry in TVDB_MISSING_CASES:
+        all_tvdb_keys.update(entry.keys())
+    extra_tvdb = [k for k in sorted(all_tvdb_keys) if k not in tvdb_missing_fieldnames]
+    final_tvdb_fieldnames = tvdb_missing_fieldnames + extra_tvdb
+
+    tvdb_rows = []
+    for entry in TVDB_MISSING_CASES:
+        row = dict(entry)
+        if "files" in row:
+            files = row["files"]
+            if isinstance(files, str):
+                files = [f for f in files.split(";") if f]
+            elif not isinstance(files, list):
+                files = []
+            row["files"] = ";".join(os.path.basename(f) for f in files)
+        tvdb_rows.append(row)
+    write_csv(tvdb_missing_path, tvdb_rows, final_tvdb_fieldnames)
 
 
 def summarize_run(
@@ -1678,13 +1780,7 @@ def summarize_run(
         mins, secs = divmod(rem, 60)
         elapsed_str = f"{hours}h {mins}m {secs}s"
 
-    cache_skipped = sum(
-        1
-        for item in items
-        if not config.dry_run
-        and config.cache.get(f"{item.title} ({item.year}) [{item.type}]")
-        and is_recent(config.cache[f"{item.title} ({item.year}) [{item.type}]"].get("last_checked", ""))
-    )
+    cache_skipped = sum(1 for item in items if getattr(item, "skipped_by_cache", False))
 
     ambiguous_count = sum(1 for case in UNMATCHED_CASES if case.get("match_reason") == "ambiguous")
 
@@ -1697,6 +1793,7 @@ def summarize_run(
         ("📺 TVDB Missing (TV)", len(TVDB_MISSING_CASES)),
         ("🔁 Reclassified (TV)", len(RECLASSIFIED)),
         ("💾 Cache Skipped", cache_skipped),
+        ("📡 TMDB API Calls", getattr(config, "_api_calls", 0)),
     ]
 
     console_rich = Console()
@@ -1709,7 +1806,7 @@ def summarize_run(
     logger.info("Summary Report:")
     for label, value in labels:
         logger.info(f"{label}: {value}")
-    active_keys = {f"{item.title} ({item.year}) [{item.type}]" for item in updated_items}
+    active_keys = {get_cache_key(item) for item in updated_items}
     if not config.no_cache:
         save_cache(config.cache, active_keys)
 
@@ -1737,9 +1834,7 @@ def main():
     items = filter_items(args, items)
     updated_items = handle_data(config, items)
     file_updates, duplicate_log = rename_files(updated_items, config)
-    export_csvs(updated_items, file_updates)
-    export_unmatched_cases_csv()
-    export_duplicate_log_csv(duplicate_log)
+    export_csvs(updated_items, file_updates, duplicate_log)
     summarize_run(start_time, items, updated_items, file_updates, config)
 
 
