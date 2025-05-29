@@ -8,3 +8,4 @@ test*
 /cache
 /duplicates
 pyproject.toml
+.vscode/settings.json
