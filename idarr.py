@@ -122,6 +122,7 @@ class LogManager:
         quiet: If True, suppresses console output.
         levels: Mapping of log level names to methods.
     """
+
     COLORS = {
         "WHITE": "\033[97m",
         "YELLOW": "\033[93m",
@@ -283,6 +284,7 @@ class SQLiteCacheManager:
         cache: In-memory dict of cache entries.
         no_cache: If True, disables persistence.
     """
+
     TABLE_SCHEMA = """
     CREATE TABLE IF NOT EXISTS cache (
         key TEXT PRIMARY KEY,
@@ -543,6 +545,7 @@ class TMDBQueryService:
         client: TMDbAPIs client.
         config: IdarrConfig instance.
     """
+
     def __init__(self, client: TMDbAPIs, config: "IdarrConfig"):
         """
         Initialize TMDBQueryService.
@@ -1156,6 +1159,7 @@ class IdarrConfig:
         tmdb_query_service: TMDBQueryService instance.
         _api_calls: Counter for API calls.
     """
+
     dry_run: bool = False
     quiet: bool = False
     log_level: str = "INFO"
@@ -1375,8 +1379,6 @@ def resolve_pending_matches(config):
 
     if updated:
         config.cache = config.cache_manager.cache
-        active = set(config.cache.keys())
-        config.cache_manager.save(active)
     save_pending_matches(pending)
 
 
@@ -1792,7 +1794,6 @@ def parse_file_group(config: "IdarrConfig", base_name: str, files: list[str]) ->
     return media_item
 
 
-
 def scan_files_in_flat_folder(config: "IdarrConfig") -> list[MediaItem]:
     """
     Scan a flat folder for image assets and group them into MediaItem instances.
@@ -1880,6 +1881,7 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
 
     from rich.console import Console
     from rich.status import Status
+
     console = Console()
 
     progress_bar = None
@@ -1929,16 +1931,18 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
             if not enriched:
                 # If enrichment failed (not found or ambiguous), always upsert as not_found
                 item.match_failed = True
-                UNMATCHED_CASES.append({
-                    "media_type": item.type,
-                    "title": item.title,
-                    "year": item.year if item.year is not None else "",
-                    "tmdb_id": getattr(item, "tmdb_id", ""),
-                    "tvdb_id": getattr(item, "tvdb_id", ""),
-                    "imdb_id": getattr(item, "imdb_id", ""),
-                    "files": ";".join(item.files),
-                    "match_reason": getattr(item, "match_reason", ""),
-                })
+                UNMATCHED_CASES.append(
+                    {
+                        "media_type": item.type,
+                        "title": item.title,
+                        "year": item.year if item.year is not None else "",
+                        "tmdb_id": getattr(item, "tmdb_id", ""),
+                        "tvdb_id": getattr(item, "tvdb_id", ""),
+                        "imdb_id": getattr(item, "imdb_id", ""),
+                        "files": ";".join(item.files),
+                        "match_reason": getattr(item, "match_reason", ""),
+                    }
+                )
                 log.debug(f"Upsert NOT_FOUND: {item.title} ({item.year})")
                 config.cache_manager.upsert(cache_key, {"status": "not_found"}, item)
                 keys_to_upsert.append(cache_key)
@@ -1951,17 +1955,17 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
                 new_key = config.cache_manager.get_cache_key(item)
                 found_cache = config.cache.get(new_key)
                 meta_changed = (
-                    found_cache.get("title") != (item.new_title or item.title) or
-                    found_cache.get("year") != (item.new_year if item.new_year is not None else item.year) or
-                    found_cache.get("tmdb_id") != (item.new_tmdb_id or item.tmdb_id) or
-                    found_cache.get("tvdb_id") != (item.new_tvdb_id or item.tvdb_id) or
-                    found_cache.get("imdb_id") != (item.new_imdb_id or item.imdb_id)
+                    found_cache.get("title") != (item.new_title or item.title)
+                    or found_cache.get("year") != (item.new_year if item.new_year is not None else item.year)
+                    or found_cache.get("tmdb_id") != (item.new_tmdb_id or item.tmdb_id)
+                    or found_cache.get("tvdb_id") != (item.new_tvdb_id or item.tvdb_id)
+                    or found_cache.get("imdb_id") != (item.new_imdb_id or item.imdb_id)
                 )
                 is_missing = found_cache is None
                 is_stale = (
-                    found_cache is not None and
-                    not config.dry_run and
-                    not is_recent(found_cache.get("last_checked", ""), config)
+                    found_cache is not None
+                    and not config.dry_run
+                    and not is_recent(found_cache.get("last_checked", ""), config)
                 )
                 if is_missing or is_stale or meta_changed:
                     log.debug(
@@ -1980,16 +1984,15 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
             if item.type == "tv_series":
                 has_tvdb = getattr(item, "tvdb_id", None) or getattr(item, "new_tvdb_id", None)
                 if not has_tvdb:
-                    TVDB_MISSING_CASES.append({
-                        "title": item.title,
-                        "year": item.year,
-                        "tmdb_id": getattr(item, "tmdb_id", ""),
-                        "imdb_id": getattr(item, "imdb_id", ""),
-                        "files": ";".join(item.files),
-                    })
-    # Batch save all upserted cache keys after enrichment loop
-    if keys_to_upsert:
-        config.cache_manager.save(set(keys_to_upsert))
+                    TVDB_MISSING_CASES.append(
+                        {
+                            "title": item.title,
+                            "year": item.year,
+                            "tmdb_id": getattr(item, "tmdb_id", ""),
+                            "imdb_id": getattr(item, "imdb_id", ""),
+                            "files": ";".join(item.files),
+                        }
+                    )
 
     new_pending = update_pending_matches_from_cache(config)
     save_pending_matches(new_pending)
@@ -2113,9 +2116,19 @@ def rename_files(
                 if src_ctime >= dst_ctime:
                     move_src = new_path
                     move_dst_name = new_filename
+                    keep_path = file_path
                 else:
                     move_src = file_path
                     move_dst_name = old_filename
+                    keep_path = new_path
+
+                if not os.path.exists(keep_path):
+                    log.warning(
+                        f"❗ [SAFEGUARD] Conflict detected but 'original' file '{os.path.basename(keep_path)}' does not exist in source. "
+                        f"Skipping move of '{os.path.basename(move_src)}' to duplicates to prevent data loss."
+                    )
+                    skipped += 1
+                    continue
 
                 dest = os.path.join(duplicates_dir, os.path.basename(move_dst_name))
                 if os.path.exists(dest):
@@ -2127,6 +2140,17 @@ def rename_files(
                     try:
                         shutil.move(move_src, dest)
                         log.warning(f"🗂️ Duplicate moved: {move_dst_name} → {dest}")
+                        duplicate_log.append(
+                            {
+                                "action": "moved",
+                                "kept_file": os.path.basename(keep_path),
+                                "kept_path": keep_path,
+                                "kept_ctime": src_ctime if move_src == new_path else dst_ctime,
+                                "moved_file": os.path.basename(move_dst_name),
+                                "moved_path": dest,
+                                "moved_ctime": src_ctime if move_src == file_path else dst_ctime,
+                            }
+                        )
                     except Exception as e:
                         log.error(f"❌ Failed to move duplicate '{move_dst_name}': {e}")
                         skipped += 1
@@ -2136,8 +2160,7 @@ def rename_files(
 
                 if src_ctime < dst_ctime:
                     continue
-            
-            # Dry-run: just record, print instantly
+
             if config.dry_run:
                 if old_filename != new_filename:
                     log.info(header)
@@ -2147,7 +2170,6 @@ def rename_files(
                     renamed += 1
                 continue
 
-            # Live rename: print instantly
             if old_filename != new_filename:
                 try:
                     os.rename(file_path, new_path)
@@ -2156,7 +2178,7 @@ def rename_files(
                     log.info(f"        + {new_filename}", "GREEN")
                     file_updates.append((media_item.type, old_filename, new_filename))
                     renamed += 1
-                    # Update cache entry
+
                     cache_key = key
                     cache_entry = config.cache.get(cache_key, {})
                     hist = cache_entry.get("rename_history", [])
@@ -2183,8 +2205,54 @@ def rename_files(
                 except Exception as e:
                     log.error(f"❌ Failed to rename {old_filename}: {e}")
                     skipped += 1
-    config.cache_manager.save(set(config.cache.keys()))
     return file_updates, duplicate_log
+
+
+def prune_orphaned_cache_entries(config: IdarrConfig) -> None:
+    """
+    Remove cache entries that are no longer associated with any files in the source directory.
+    Args:
+        config: The IdarrConfig instance, with source_dir and cache_manager.
+    Side effects:
+        Modifies the cache, deletes orphaned entries from SQLite.
+    """
+    from rich.console import Console
+
+    console = Console()
+    log.info("🧹 Starting prune operation for orphaned cache entries...")
+
+    try:
+        current_files = set(os.listdir(config.source_dir))
+    except Exception as e:
+        log.error(f"Failed to list source directory: {e}")
+        return
+
+    removed_keys = []
+    cache_items = list(config.cache.items())
+    total = len(cache_items)
+    entries_update = 10
+
+    with console.status("[cyan]Pruning orphaned cache entries...", spinner="dots") as status:
+        for idx, (key, entry) in enumerate(cache_items, 1):
+            originals = set(entry.get("original_filenames", []))
+            currents = set(entry.get("current_filenames", []))
+            relevant = originals | currents
+            if not (relevant & current_files):
+                log.info(
+                    f"🗑️ Pruning orphaned cache entry: {entry.get('title')} ({entry.get('year')}) [{key}]"
+                )
+                with sqlite3.connect(config.cache_manager.db_path) as conn:
+                    conn.execute("DELETE FROM cache WHERE key = ?", (key,))
+                    conn.commit()
+                removed_keys.append(key)
+            if idx % entries_update == 0 or idx == total:
+                status.update(f"[cyan]Searching, Please wait... ({idx:,}/{total:,})")
+
+    for key in removed_keys:
+        config.cache.pop(key, None)
+        config.cache_manager.cache.pop(key, None)
+
+    log.info(f"✅ Prune operation complete. {len(removed_keys)} entries removed.")
 
 
 def print_rich_help() -> None:
@@ -2227,6 +2295,7 @@ def print_rich_help() -> None:
     table.add_row("[bold]Export & Recovery[/bold]", "")
     table.add_row("--show-unmatched", "Print unmatched items even in quiet mode")
     table.add_row("--revert", "Undo renames using the cache file for history")
+    table.add_row("--prune", "Prune cache entries that are no longer associated with a file")
     table.add_section()
 
     # Other
@@ -2296,6 +2365,11 @@ def parse_args() -> argparse.Namespace:
     extra = parser.add_argument_group("Export & Recovery")
     extra.add_argument("--show-unmatched", action="store_true", help=argparse.SUPPRESS)
     extra.add_argument("--revert", action="store_true", help=argparse.SUPPRESS)
+    extra.add_argument(
+        "--prune",
+        action="store_true",
+        help="Prune cache entries not associated with any file in the source directory.",
+    )
 
     args = parser.parse_args()
     if getattr(args, "help", False):
@@ -2366,6 +2440,7 @@ def load_runtime_config(args: argparse.Namespace) -> IdarrConfig:
 
     def _flush():
         try:
+            pass
             config.cache_manager.save(set(config.cache_manager.cache.keys()))
         except Exception:
             pass
@@ -2404,6 +2479,7 @@ def print_settings(config: "IdarrConfig") -> None:
 
     settings.append(("Export/Recovery", "SHOW_UNMATCHED", str(getattr(config, "show_unmatched", False))))
     settings.append(("Export/Recovery", "REVERT", str(getattr(config, "revert", False))))
+    settings.append(("Prune", "PRUNE", str(getattr(config, "revert", False))))
 
     settings.append(("TMDB", "TMDB_API_KEY", "********" if getattr(config, "tmdb_api_key", None) else None))
 
@@ -2798,24 +2874,23 @@ def summarize_run(
     log.info("Summary Report:", color="", console=False)
     for label, value in labels:
         log.info(f"{label}: {value}", color="", console=False)
-    active_keys = {config.cache_manager.get_cache_key(item) for item in updated_items}
-    if not config.no_cache:
-        config.cache_manager.save(active_keys)
 
 
 def main():
     args = parse_args()
-    if getattr(args, "filter", False):
-        if not (args.type or args.year or args.contains):
-            log.error("❌ --filter requires at least one of --type, --year, or --contains")
-            exit(1)
-    config = load_runtime_config(args)
-    resolve_pending_matches(config)
     log.info(
         f"************************* IDARR Version: {FULL_VERSION} *************************",
         color="",
         console=False,
     )
+    if getattr(args, "filter", False):
+        if not (args.type or args.year or args.contains):
+            log.error("❌ --filter requires at least one of --type, --year, or --contains")
+            exit(1)
+    config = load_runtime_config(args)
+    if args.prune:
+        prune_orphaned_cache_entries(config)
+        sys.exit(0)
 
     ignored_title_keys, pending_matches = load_ignore_and_migrate_pending(config)
     config.pending_matches = pending_matches
