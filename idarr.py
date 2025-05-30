@@ -456,7 +456,7 @@ class SQLiteCacheManager:
             value: Dict of new values.
             item: Optional MediaItem to fill missing fields.
         Side effects:
-            Updates cache, resolves collisions, saves to database.
+            Updates cache, resolves collisions.
         """
         existing = self.cache.get(key, {})
         merged = {**existing, **value}
@@ -483,7 +483,6 @@ class SQLiteCacheManager:
                 merged["status"] = merged.get("status", "not_found")
 
         self.verify_and_resolve_collision(key, merged)
-        self.save(set(self.cache.keys()))
 
     def get_cache_key(self, item: Any) -> str:
         """
@@ -1901,98 +1900,116 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
     ignored_count = 0
     keys_to_upsert = []
 
-    with console.status("[cyan]Skipping cached items...") as status:
-        for item in items:
-            raw_title_key = f"{item.title} ({item.year})" if item.year else item.title
-            cache_key = config.cache_manager.get_cache_key(item)
+    status = None  # Only create status when needed
 
-            # Exclusion/ignore list
-            if raw_title_key in ignored_title_keys:
-                log.debug(f"⏭️ Ignored by user-defined exclusions: {raw_title_key}")
-                if raw_title_key in pending_matches:
-                    del pending_matches[raw_title_key]
-                if config.quiet and progress_bar is not None:
-                    progress.update(task, advance=1)
-                ignored_count += 1
-                continue
-            if getattr(config, "skip_collections", False) and getattr(item, "type", None) == "collection":
-                log.info(f"⏭️  Skipped collection: {item.title}")
-                continue
+    for item in items:
+        raw_title_key = f"{item.title} ({item.year})" if item.year else item.title
+        cache_key = config.cache_manager.get_cache_key(item)
 
-            # Enrich or skip using cache
-            enriched = item.enrich()
-            cache_key = config.cache_manager.get_cache_key(item)
-
-            if getattr(item, "skipped_by_cache", False):
-                skipped_count += 1
-                status.update(f"[cyan]Skipped: {skipped_count:,} items... (still working)")
-                continue
-
-            if not enriched:
-                # If enrichment failed (not found or ambiguous), always upsert as not_found
-                item.match_failed = True
-                UNMATCHED_CASES.append(
-                    {
-                        "media_type": item.type,
-                        "title": item.title,
-                        "year": item.year if item.year is not None else "",
-                        "tmdb_id": getattr(item, "tmdb_id", ""),
-                        "tvdb_id": getattr(item, "tvdb_id", ""),
-                        "imdb_id": getattr(item, "imdb_id", ""),
-                        "files": ";".join(item.files),
-                        "match_reason": getattr(item, "match_reason", ""),
-                    }
-                )
-                log.debug(f"Upsert NOT_FOUND: {item.title} ({item.year})")
-                config.cache_manager.upsert(cache_key, {"status": "not_found"}, item)
-                keys_to_upsert.append(cache_key)
-                if raw_title_key not in pending_matches:
-                    pending_matches[raw_title_key] = "add_tmdb_url_here"
-                if config.quiet and progress_bar is not None:
-                    progress.update(task, advance=1)
-                continue
-            else:
-                new_key = config.cache_manager.get_cache_key(item)
-                found_cache = config.cache.get(new_key)
-                meta_changed = (
-                    found_cache.get("title") != (item.new_title or item.title)
-                    or found_cache.get("year") != (item.new_year if item.new_year is not None else item.year)
-                    or found_cache.get("tmdb_id") != (item.new_tmdb_id or item.tmdb_id)
-                    or found_cache.get("tvdb_id") != (item.new_tvdb_id or item.tvdb_id)
-                    or found_cache.get("imdb_id") != (item.new_imdb_id or item.imdb_id)
-                )
-                is_missing = found_cache is None
-                is_stale = (
-                    found_cache is not None
-                    and not config.dry_run
-                    and not is_recent(found_cache.get("last_checked", ""), config)
-                )
-                if is_missing or is_stale or meta_changed:
-                    log.debug(
-                        f"Upsert FOUND: {item.title} ({item.year}), "
-                        f"is_missing={is_missing}, is_stale={is_stale}, meta_changed={meta_changed}"
-                    )
-                    config.cache_manager.upsert(new_key, {"status": "found"}, item)
-                    keys_to_upsert.append(new_key)
-                else:
-                    log.debug(f"NO UPSERT NEEDED: {item.title} ({item.year}) - fully cached and unchanged.")
-
+        # Exclusion/ignore list
+        if raw_title_key in ignored_title_keys:
+            log.debug(f"⏭️ Ignored by user-defined exclusions: {raw_title_key}")
+            if raw_title_key in pending_matches:
+                del pending_matches[raw_title_key]
             if config.quiet and progress_bar is not None:
                 progress.update(task, advance=1)
-            if enriched and raw_title_key in pending_matches:
-                del pending_matches[raw_title_key]
-            if item.type == "tv_series":
-                has_tvdb = getattr(item, "tvdb_id", None) or getattr(item, "new_tvdb_id", None)
-                if not has_tvdb:
-                    TVDB_MISSING_CASES.append(
-                        {
-                            "title": item.title,
-                            "year": item.year,
-                            "tmdb_id": getattr(item, "tmdb_id", ""),
-                            "imdb_id": getattr(item, "imdb_id", ""),
-                            "files": ";".join(item.files),
-                        }
-                    )
+            ignored_count += 1
+            continue
+        if getattr(config, "skip_collections", False) and getattr(item, "type", None) == "collection":
+            log.info(f"⏭️  Skipped collection: {item.title}")
+            continue
+
+        # Enrich or skip using cache
+        enriched = item.enrich()
+        cache_key = config.cache_manager.get_cache_key(item)
+
+        if getattr(item, "skipped_by_cache", False):
+            skipped_count += 1
+            # Start status bar if not started, but only when skipping is actually happening
+            if status is None and config.quiet:
+                status = console.status("[cyan]Skipping cached items...", spinner="dots")
+                status.__enter__()
+            if config.quiet and status is not None:
+                if skipped_count == 1:
+                    status.update(f"[cyan]Skipped: 1 item... (still working)")
+                elif skipped_count > 1:
+                    status.update(f"[cyan]Skipped: {skipped_count:,} items... (still working)")
+            continue
+
+        # Clean up the status if it was ever started
+        if status is not None:
+            status.__exit__(None, None, None)
+            status = None
+
+        if not enriched:
+            # If enrichment failed (not found or ambiguous), always upsert as not_found
+            item.match_failed = True
+            UNMATCHED_CASES.append(
+                {
+                    "media_type": item.type,
+                    "title": item.title,
+                    "year": item.year if item.year is not None else "",
+                    "tmdb_id": getattr(item, "tmdb_id", ""),
+                    "tvdb_id": getattr(item, "tvdb_id", ""),
+                    "imdb_id": getattr(item, "imdb_id", ""),
+                    "files": ";".join(item.files),
+                    "match_reason": getattr(item, "match_reason", ""),
+                }
+            )
+            log.debug(f"Upsert NOT_FOUND: {item.title} ({item.year})")
+            config.cache_manager.upsert(cache_key, {"status": "not_found"}, item)
+            keys_to_upsert.append(cache_key)
+            if raw_title_key not in pending_matches:
+                pending_matches[raw_title_key] = "add_tmdb_url_here"
+            if config.quiet and progress_bar is not None:
+                progress.update(task, advance=1)
+            continue
+        else:
+            new_key = config.cache_manager.get_cache_key(item)
+            found_cache = config.cache.get(new_key)
+            meta_changed = (
+                found_cache.get("title") != (item.new_title or item.title)
+                or found_cache.get("year") != (item.new_year if item.new_year is not None else item.year)
+                or found_cache.get("tmdb_id") != (item.new_tmdb_id or item.tmdb_id)
+                or found_cache.get("tvdb_id") != (item.new_tvdb_id or item.tvdb_id)
+                or found_cache.get("imdb_id") != (item.new_imdb_id or item.imdb_id)
+            )
+            is_missing = found_cache is None
+            is_stale = (
+                found_cache is not None
+                and not config.dry_run
+                and not is_recent(found_cache.get("last_checked", ""), config)
+            )
+            if is_missing or is_stale or meta_changed:
+                log.debug(
+                    f"Upsert FOUND: {item.title} ({item.year}), "
+                    f"is_missing={is_missing}, is_stale={is_stale}, meta_changed={meta_changed}"
+                )
+                config.cache_manager.upsert(new_key, {"status": "found"}, item)
+                keys_to_upsert.append(new_key)
+            else:
+                log.debug(f"NO UPSERT NEEDED: {item.title} ({item.year}) - fully cached and unchanged.")
+
+        if config.quiet and progress_bar is not None:
+            progress.update(task, advance=1)
+        if enriched and raw_title_key in pending_matches:
+            del pending_matches[raw_title_key]
+        if item.type == "tv_series":
+            has_tvdb = getattr(item, "tvdb_id", None) or getattr(item, "new_tvdb_id", None)
+            if not has_tvdb:
+                TVDB_MISSING_CASES.append(
+                    {
+                        "title": item.title,
+                        "year": item.year,
+                        "tmdb_id": getattr(item, "tmdb_id", ""),
+                        "imdb_id": getattr(item, "imdb_id", ""),
+                        "files": ";".join(item.files),
+                    }
+                )
+
+    # If status bar is still up at the end, close it
+    if status is not None:
+        status.__exit__(None, None, None)
 
     new_pending = update_pending_matches_from_cache(config)
     save_pending_matches(new_pending)
