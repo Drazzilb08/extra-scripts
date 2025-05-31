@@ -112,8 +112,9 @@ COUNTRY_CODES = {
 }
 console = Console()
 status_context = None
-progress_context = None  # Global context manager for Progress bar
-progress_bar = None      # Global Progress object
+progress_context = None
+progress_bar = None
+
 
 # --- Log Manager class ---
 class LogManager:
@@ -230,7 +231,6 @@ class LogManager:
         self.logger.error(msg)
 
 
-# Global log manager
 log = LogManager(__name__, LOG_PATH)
 
 
@@ -506,6 +506,47 @@ class SQLiteCacheManager:
             normalized_title = normalize_cache_key(item.title)
         year_val = orig_year if orig_year is not None else item.year
         return f"{normalized_title}-{year_val or 'noyear'}"
+
+    def delete(self, query: str | int) -> bool:
+        """
+        Delete cache entries by TMDB ID (int), or by 'Title (Year)' / 'Title' (str).
+        Returns True if any entries were deleted, False otherwise.
+        """
+        found = False
+
+        # If input is int or a digit string, treat as TMDB ID
+        if isinstance(query, int) or (isinstance(query, str) and query.isdigit()):
+            tmdb_id = int(query)
+            for key, entry in list(self.cache.items()):
+                if entry.get("tmdb_id") == tmdb_id:
+                    self._delete_by_key(key)
+                    found = True
+            return found
+
+        # Otherwise, treat as title (with optional year)
+        import re
+
+        m = re.match(r"^(.*?)(?: \((\d{4})\))?$", query.strip())
+        if m:
+            title = m.group(1).strip()
+            year = int(m.group(2)) if m.group(2) else None
+            for key, entry in list(self.cache.items()):
+                if entry.get("title") == title and (
+                    entry.get("year") == year
+                    or (year is None and (entry.get("year") is None or entry.get("year") == ""))
+                ):
+                    self._delete_by_key(key)
+                    found = True
+        return found
+
+    def _delete_by_key(self, key: str) -> None:
+        """Helper to delete from both cache and DB by key."""
+        if key in self.cache:
+            del self.cache[key]
+        if not self.no_cache:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("DELETE FROM cache WHERE key = ?", (key,))
+                conn.commit()
 
 
 def ensure_title_year(entry: dict, item: Any = None) -> dict:
@@ -1274,7 +1315,6 @@ def resolve_pending_matches(config):
     existing = []
     if os.path.exists(IGNORED_TITLES_PATH):
 
-        # Read all lines, strip comment lines
         with open(IGNORED_TITLES_PATH, encoding="utf-8") as f:
             lines = f.readlines()
         content_lines = [line for line in lines if not line.lstrip().startswith("//")]
@@ -1309,7 +1349,19 @@ def resolve_pending_matches(config):
                 if entry.get("title") == title and (
                     entry.get("year") == year or (year is None and not entry.get("year"))
                 ):
-                    config.cache_manager.upsert(cache_key, {"status": "ignored"})
+                    config.cache_manager.upsert(
+                        cache_key,
+                        {
+                            "title": title,
+                            "year": year,
+                            "type": entry.get("type"),
+                            "tmdb_id": entry.get("tmdb_id"),
+                            "tvdb_id": entry.get("tvdb_id"),
+                            "imdb_id": entry.get("imdb_id"),
+                            "status": "ignored",
+                            "last_checked": datetime.now().isoformat(),
+                        },
+                    )
                     break
             ignored.add(key)
             del pending[key]
@@ -1353,6 +1405,26 @@ def resolve_pending_matches(config):
             )
             media_item.enrich()
             new_key = config.cache_manager.get_cache_key(media_item)
+            resolved_title = media_item.new_title or media_item.title
+            resolved_year = media_item.new_year if media_item.new_year is not None else media_item.year
+            resolved_tmdb_id = (
+                media_item.new_tmdb_id if media_item.new_tmdb_id is not None else media_item.tmdb_id
+            )
+            resolved_type = media_item.type
+
+            config.cache_manager.upsert(
+                new_key,
+                {
+                    "title": resolved_title,
+                    "year": resolved_year,
+                    "type": resolved_type,
+                    "tmdb_id": resolved_tmdb_id,
+                    "tvdb_id": media_item.new_tvdb_id or media_item.tvdb_id,
+                    "imdb_id": media_item.new_imdb_id or media_item.imdb_id,
+                    "status": "found",
+                    "last_checked": datetime.now().isoformat(),
+                },
+            )
             if old_key in config.cache_manager.cache:
                 config.cache_manager.cache.pop(old_key)
             with sqlite3.connect(config.cache_manager.db_path) as conn:
@@ -1884,7 +1956,6 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
     ignored_count = 0
     total_items = len(items)
 
-    # Only print starting message if there are items to process
     if total_items > 0:
         log.info("🔄 Starting metadata enrichment via TMDB")
 
@@ -1897,13 +1968,11 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
             raw_title_key = f"{item.title} ({item.year})" if item.year else item.title
             cache_key = config.cache_manager.get_cache_key(item)
 
-            # Exclusion/ignore list
             if raw_title_key in ignored_title_keys:
                 log.debug(f"⏭️ Ignored by user-defined exclusions: {raw_title_key}")
                 if raw_title_key in pending_matches:
                     del pending_matches[raw_title_key]
                 ignored_count += 1
-                # Still update the progress bar, even if ignored
                 if idx % 10 == 0 or idx == total_items:
                     status.update(f"[green]Processing {idx}/{total_items} items...")
                 continue
@@ -1985,12 +2054,10 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
     save_pending_matches(new_pending)
     config.pending_matches = new_pending
 
-    # Only print unmatched cases if any exist
     if config.show_unmatched and UNMATCHED_CASES:
         for case in UNMATCHED_CASES:
             title = case.get("title", "Unknown")
             log.warning(f"❌ Unmatched: {title}")
-    # Only print completed message if there were items processed or ignored
     if total_items > 0 or ignored_count > 0:
         log.info(f"✅ Completed metadata enrichment ({ignored_count} item(s) ignored by exclusion list)")
     return items
@@ -2055,7 +2122,6 @@ def rename_files(
     Returns grouped diff-style output once per media item.
     """
     mode = "DRY RUN" if config.dry_run else "LIVE"
-    # Only print starting message if there are items to rename (i.e., not all are match_failed)
     non_skipped_items = [item for item in items if not getattr(item, "match_failed", False)]
     if len(non_skipped_items) > 0:
         log.info(f"🏷  Starting file rename process ({mode} mode)")
@@ -2089,7 +2155,6 @@ def rename_files(
 
             key = config.cache_manager.get_cache_key(media_item)
 
-            # To group per media item
             item_renames = []
 
             for file_path in media_item.files:
@@ -2164,7 +2229,6 @@ def rename_files(
                     if not config.dry_run:
                         try:
                             os.rename(file_path, new_path)
-                            # Update cache only after successful rename
                             cache_key = key
                             cache_entry = config.cache.get(cache_key, {})
                             hist = cache_entry.get("rename_history", [])
@@ -2182,17 +2246,20 @@ def rename_files(
                             cache_entry["original_filenames"] = sorted(origs)
 
                             real_files = (
-                                set(os.listdir(config.source_dir)) if os.path.isdir(config.source_dir) else set()
+                                set(os.listdir(config.source_dir))
+                                if os.path.isdir(config.source_dir)
+                                else set()
                             )
                             possibles = set(cache_entry["original_filenames"]) | {h["to"] for h in hist}
                             cache_entry["current_filenames"] = sorted(f for f in possibles if f in real_files)
 
                             config.cache[cache_key] = cache_entry
                         except Exception as e:
+                            log.error(f"file_path: {file_path}")
+                            log.error(f"new_path: {new_path}")
                             log.error(f"❌ Failed to rename {old_filename}: {e}")
                             skipped += 1
 
-            # Print/group once per media item, but only if any renames happened
             if item_renames:
                 log.info(header)
                 for old_filename, new_filename in item_renames:
@@ -2201,16 +2268,15 @@ def rename_files(
 
     return file_updates, duplicate_log
 
+
 def flush_status():
     global status_context, progress_context, progress_bar
-    # Flush Rich status spinner if active
     if status_context is not None:
         try:
             status_context.__exit__(None, None, None)
         except Exception:
             pass
         status_context = None
-    # Flush Rich progress bar if active
     if progress_context is not None:
         try:
             progress_context.__exit__(None, None, None)
@@ -2242,9 +2308,7 @@ def prune_orphaned_cache_entries(config: IdarrConfig) -> None:
         currents = set(entry.get("current_filenames", []))
         relevant = originals | currents
         if not (relevant & current_files):
-            log.info(
-                f"🗑️ Pruning orphaned cache entry: {entry.get('title')} ({entry.get('year')}) [{key}]"
-            )
+            log.info(f"🗑️ Pruning orphaned cache entry: {entry.get('title')} ({entry.get('year')}) [{key}]")
             with sqlite3.connect(config.cache_manager.db_path) as conn:
                 conn.execute("DELETE FROM cache WHERE key = ?", (key,))
                 conn.commit()
@@ -2274,6 +2338,7 @@ def print_rich_help() -> None:
     table.add_row("--limit N", "Maximum number of items to process")
     table.add_row("--remove-non-image-files", "Remove non-image files (default: ignore them)")
     table.add_row("--ignore-file PATH", "Path to ignored_titles.jsonc file")
+    table.add_row("--pending-matches", "Only process pending matches list")
     table.add_section()
 
     # Caching Options
@@ -2282,6 +2347,8 @@ def print_rich_help() -> None:
     table.add_row("--clear-cache", "Delete the existing metadata cache before running")
     table.add_row("--cache-path PATH", "Specify a custom cache file path")
     table.add_row("--no-cache", "Skip loading or saving the cache")
+    table.add_row("--prune", "Prune cache entries that are no longer associated with a file")
+    table.add_row("--purge", 'Delete cache entries by TMDB ID or by "Title (Year)" or "Title"')
     table.add_section()
 
     # Filtering Options
@@ -2298,7 +2365,6 @@ def print_rich_help() -> None:
     table.add_row("[bold]Export & Recovery[/bold]", "")
     table.add_row("--show-unmatched", "Print unmatched items even in quiet mode")
     table.add_row("--revert", "Undo renames using the cache file for history")
-    table.add_row("--prune", "Prune cache entries that are no longer associated with a file")
     table.add_section()
 
     # Other
@@ -2344,6 +2410,11 @@ def parse_args() -> argparse.Namespace:
         default=os.path.join(LOG_DIR, "ignored_titles.jsonc"),
         help=argparse.SUPPRESS,
     )
+    general.add_argument(
+        "--pending-matches",
+        action="store_true",
+        help="Only process and resolve pending matches (including renaming just-resolved entries).",
+    )
 
     cache = parser.add_argument_group("Caching Options")
     cache.add_argument(
@@ -2356,6 +2427,14 @@ def parse_args() -> argparse.Namespace:
     cache.add_argument("--clear-cache", action="store_true", help=argparse.SUPPRESS)
     cache.add_argument("--cache-path", metavar="PATH", type=str, default=CACHE_PATH, help=argparse.SUPPRESS)
     cache.add_argument("--no-cache", action="store_true", help=argparse.SUPPRESS)
+    cache.add_argument(
+        "--prune",
+        action="store_true",
+        help="Prune cache entries not associated with any file in the source directory.",
+    )
+    cache.add_argument(
+        "--purge", type=str, help='Delete cache entries by TMDB ID or by "Title (Year)" or "Title"'
+    )
 
     filtering = parser.add_argument_group("Filtering Options")
     filtering.add_argument("--filter", action="store_true", help=argparse.SUPPRESS)
@@ -2368,11 +2447,6 @@ def parse_args() -> argparse.Namespace:
     extra = parser.add_argument_group("Export & Recovery")
     extra.add_argument("--show-unmatched", action="store_true", help=argparse.SUPPRESS)
     extra.add_argument("--revert", action="store_true", help=argparse.SUPPRESS)
-    extra.add_argument(
-        "--prune",
-        action="store_true",
-        help="Prune cache entries not associated with any file in the source directory.",
-    )
 
     args = parser.parse_args()
     if getattr(args, "help", False):
@@ -2478,10 +2552,11 @@ def print_settings(config: "IdarrConfig") -> None:
     settings.append(("Caching", "NO_CACHE", str(getattr(config, "no_cache", False))))
     settings.append(("Caching", "CLEAR_CACHE", str(getattr(config, "clear_cache", False))))
     settings.append(("Caching", "FREQUENCY_DAYS", str(getattr(config, "frequency_days", 30))))
+    settings.append(("Caching", "PRUNE", str(getattr(config, "prune", False))))
+    settings.append(("Caching", "PURGE", str(getattr(config, "purge", False))))
 
     settings.append(("Export/Recovery", "SHOW_UNMATCHED", str(getattr(config, "show_unmatched", False))))
     settings.append(("Export/Recovery", "REVERT", str(getattr(config, "revert", False))))
-    settings.append(("Prune", "PRUNE", str(getattr(config, "revert", False))))
 
     settings.append(("TMDB", "TMDB_API_KEY", "********" if getattr(config, "tmdb_api_key", None) else None))
 
@@ -2609,6 +2684,7 @@ def export_csvs(
     """
 
     with console.status("[cyan]Exporting CSVs... Please wait.", spinner="dots"):
+
         def write_csv(path, rows, fieldnames):
             if not rows:
                 return
@@ -2621,7 +2697,6 @@ def export_csvs(
                 writer.writeheader()
                 for row in rows:
                     writer.writerow(row)
-            # Only print if the file is actually written with data
             if rows:
                 log.info(f"⚙️ CSV written to {path}")
 
@@ -2880,6 +2955,55 @@ def summarize_run(
         log.info(f"{label}: {value}", color="", console=False)
 
 
+def handle_special_arguments(args, config, ignored_title_keys):
+    if getattr(args, "prune", False):
+        prune_orphaned_cache_entries(config)
+        sys.exit(0)
+    if getattr(args, "purge", False):
+        deleted = config.cache_manager.delete(args.purge)
+        if deleted:
+            print(f"Cache entry/entries matching '{args.purge}' deleted.")
+        else:
+            print(f"No cache entry found matching '{args.purge}'.")
+        sys.exit(0)
+    if getattr(args, "pending_matches", False):
+        resolve_pending_matches(config)
+        just_resolved_items = []
+        source_dir = (
+            getattr(config, "source_dir", None)
+            or getattr(config, "source", None)
+            or getattr(getattr(config, "args", {}), "source", None)
+        )
+        for cache_key, entry in config.cache.items():
+            if entry.get("status") == "found" and cache_key not in ignored_title_keys:
+                media_item = MediaItem(
+                    config=config,
+                    type=entry.get("type", "movie"),
+                    title=entry.get("title"),
+                    year=entry.get("year"),
+                    tmdb_id=entry.get("tmdb_id"),
+                    tvdb_id=entry.get("tvdb_id"),
+                    imdb_id=entry.get("imdb_id"),
+                    files=[
+                        f if os.path.isabs(f) else os.path.join(source_dir, f)
+                        for f in entry.get("current_filenames", [])
+                    ],
+                )
+                just_resolved_items.append(media_item)
+        if just_resolved_items:
+            rename_files(just_resolved_items, config)
+        else:
+            log.info("No newly resolved pending matches to process.")
+        sys.exit(0)
+        sys.exit(0)
+    if getattr(args, "revert", False):
+        items = scan_files_in_flat_folder(config)
+        items = filter_items(args, items)
+        if items:
+            perform_revert(config, items)
+        sys.exit(0)
+
+
 def main():
     args = parse_args()
     log.info(
@@ -2892,29 +3016,19 @@ def main():
             log.error("❌ --filter requires at least one of --type, --year, or --contains")
             exit(1)
     config = load_runtime_config(args)
-    if args.prune:
-        prune_orphaned_cache_entries(config)
-        sys.exit(0)
-
     ignored_title_keys, pending_matches = load_ignore_and_migrate_pending(config)
     config.pending_matches = pending_matches
     config.ignored_title_keys = ignored_title_keys
 
+    handle_special_arguments(args, config, ignored_title_keys)
+
     if config.log_level == "DEBUG":
         print_settings(config)
-
-    if getattr(args, "revert", False):
-        items = scan_files_in_flat_folder(config)
-        items = filter_items(args, items)
-        if items:
-            perform_revert(config, items)
-        return
 
     start_time = time.time()
     items = scan_files_in_flat_folder(config)
     items = filter_items(args, items)
     if not items:
-        # Avoid log output for empty runs
         log.info("No items found to process. Exiting.")
         return
     updated_items = handle_data(config, items)
