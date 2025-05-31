@@ -32,7 +32,6 @@ try:
     from unidecode import unidecode
     from dotenv import load_dotenv
     from rich.console import Console
-    from rich.status import Status
     from rich.table import Table
     from rich.prompt import Prompt
     from rich.traceback import Traceback
@@ -111,7 +110,10 @@ COUNTRY_CODES = {
     "MX",
     "TR",
 }
-
+console = Console()
+status_context = None
+progress_context = None  # Global context manager for Progress bar
+progress_bar = None      # Global Progress object
 
 # --- Log Manager class ---
 class LogManager:
@@ -386,7 +388,6 @@ class SQLiteCacheManager:
         """
         if self.no_cache:
             return
-        console = Console()
         with console.status("[grey50]Saving cache...", spinner="dots"):
             with sqlite3.connect(self.db_path) as conn:
                 keys_to_delete = [k for k in self.cache if k not in active_keys]
@@ -1272,7 +1273,6 @@ def resolve_pending_matches(config):
     ignored = set()
     existing = []
     if os.path.exists(IGNORED_TITLES_PATH):
-        import io
 
         # Read all lines, strip comment lines
         with open(IGNORED_TITLES_PATH, encoding="utf-8") as f:
@@ -1840,7 +1840,8 @@ def scan_files_in_flat_folder(config: "IdarrConfig") -> list[MediaItem]:
     groups = dict(sorted(groups.items(), key=lambda x: x[0].lower()))
 
     all_files = [file for group in groups.values() for file in group if not file.startswith(".")]
-    with Progress(
+    global progress_context, progress_bar
+    progress_bar = Progress(
         TextColumn("{task.description}"),
         BarColumn(bar_width=None),
         MofNCompleteColumn(),
@@ -1848,13 +1849,18 @@ def scan_files_in_flat_folder(config: "IdarrConfig") -> list[MediaItem]:
         TimeElapsedColumn(),
         TimeRemainingColumn(),
         expand=True,
-    ) as progress:
-        task = progress.add_task(
+        console=console,
+    )
+    progress_context = progress_bar.__enter__()
+    try:
+        task = progress_bar.add_task(
             f"Processing files {os.path.basename(config.source_dir)}...", total=len(all_files)
         )
         for base_name, files in groups.items():
             assets_dict.append(parse_file_group(config, base_name, files))
-            progress.update(task, advance=len(files))
+            progress_bar.update(task, advance=len(files))
+    finally:
+        flush_status()
     total_assets = sum(len(v) for v in groups.values())
     log.info(
         f"✅ Completed scanning: discovered {len(assets_dict)} asset groups covering {total_assets} files"
@@ -1875,153 +1881,118 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
     Side effects:
         Updates cache, logs, updates pending matches.
     """
-    log.info("🔄 Starting metadata enrichment via TMDB")
-    skipped_count = 0
+    ignored_count = 0
+    total_items = len(items)
 
-    from rich.console import Console
-    from rich.status import Status
-
-    console = Console()
-
-    progress_bar = None
-    if config.quiet:
-        progress_bar = Progress(
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(bar_width=None),
-            TaskProgressColumn(),
-            TimeElapsedColumn(),
-            expand=True,
-        )
-        progress = progress_bar.__enter__()
-        task = progress.add_task("Enriching metadata...", total=len(items))
+    # Only print starting message if there are items to process
+    if total_items > 0:
+        log.info("🔄 Starting metadata enrichment via TMDB")
 
     pending_matches = getattr(config, "pending_matches", {}).copy()
     ignored_title_keys = set(getattr(config, "ignored_title_keys", set()))
-    ignored_count = 0
     keys_to_upsert = []
 
-    status = None  # Only create status when needed
+    with console.status(f"[green]Processing 1/{total_items} items...") as status:
+        for idx, item in enumerate(items, 1):
+            raw_title_key = f"{item.title} ({item.year})" if item.year else item.title
+            cache_key = config.cache_manager.get_cache_key(item)
 
-    for item in items:
-        raw_title_key = f"{item.title} ({item.year})" if item.year else item.title
-        cache_key = config.cache_manager.get_cache_key(item)
+            # Exclusion/ignore list
+            if raw_title_key in ignored_title_keys:
+                log.debug(f"⏭️ Ignored by user-defined exclusions: {raw_title_key}")
+                if raw_title_key in pending_matches:
+                    del pending_matches[raw_title_key]
+                ignored_count += 1
+                # Still update the progress bar, even if ignored
+                if idx % 10 == 0 or idx == total_items:
+                    status.update(f"[green]Processing {idx}/{total_items} items...")
+                continue
 
-        # Exclusion/ignore list
-        if raw_title_key in ignored_title_keys:
-            log.debug(f"⏭️ Ignored by user-defined exclusions: {raw_title_key}")
-            if raw_title_key in pending_matches:
-                del pending_matches[raw_title_key]
-            if config.quiet and progress_bar is not None:
-                progress.update(task, advance=1)
-            ignored_count += 1
-            continue
-        if getattr(config, "skip_collections", False) and getattr(item, "type", None) == "collection":
-            log.info(f"⏭️  Skipped collection: {item.title}")
-            continue
+            if getattr(config, "skip_collections", False) and getattr(item, "type", None) == "collection":
+                log.info(f"⏭️  Skipped collection: {item.title}")
+                continue
 
-        # Enrich or skip using cache
-        enriched = item.enrich()
-        cache_key = config.cache_manager.get_cache_key(item)
+            enriched = item.enrich()
+            cache_key = config.cache_manager.get_cache_key(item)
 
-        if getattr(item, "skipped_by_cache", False):
-            skipped_count += 1
-            # Start status bar if not started, but only when skipping is actually happening
-            if status is None and config.quiet:
-                status = console.status("[cyan]Skipping cached items...", spinner="dots")
-                status.__enter__()
-            if config.quiet and status is not None:
-                if skipped_count == 1:
-                    status.update(f"[cyan]Skipped: 1 item... (still working)")
-                elif skipped_count > 1:
-                    status.update(f"[cyan]Skipped: {skipped_count:,} items... (still working)")
-            continue
-
-        # Clean up the status if it was ever started
-        if status is not None:
-            status.__exit__(None, None, None)
-            status = None
-
-        if not enriched:
-            # If enrichment failed (not found or ambiguous), always upsert as not_found
-            item.match_failed = True
-            UNMATCHED_CASES.append(
-                {
-                    "media_type": item.type,
-                    "title": item.title,
-                    "year": item.year if item.year is not None else "",
-                    "tmdb_id": getattr(item, "tmdb_id", ""),
-                    "tvdb_id": getattr(item, "tvdb_id", ""),
-                    "imdb_id": getattr(item, "imdb_id", ""),
-                    "files": ";".join(item.files),
-                    "match_reason": getattr(item, "match_reason", ""),
-                }
-            )
-            log.debug(f"Upsert NOT_FOUND: {item.title} ({item.year})")
-            config.cache_manager.upsert(cache_key, {"status": "not_found"}, item)
-            keys_to_upsert.append(cache_key)
-            if raw_title_key not in pending_matches:
-                pending_matches[raw_title_key] = "add_tmdb_url_here"
-            if config.quiet and progress_bar is not None:
-                progress.update(task, advance=1)
-            continue
-        else:
-            new_key = config.cache_manager.get_cache_key(item)
-            found_cache = config.cache.get(new_key)
-            meta_changed = (
-                found_cache.get("title") != (item.new_title or item.title)
-                or found_cache.get("year") != (item.new_year if item.new_year is not None else item.year)
-                or found_cache.get("tmdb_id") != (item.new_tmdb_id or item.tmdb_id)
-                or found_cache.get("tvdb_id") != (item.new_tvdb_id or item.tvdb_id)
-                or found_cache.get("imdb_id") != (item.new_imdb_id or item.imdb_id)
-            )
-            is_missing = found_cache is None
-            is_stale = (
-                found_cache is not None
-                and not config.dry_run
-                and not is_recent(found_cache.get("last_checked", ""), config)
-            )
-            if is_missing or is_stale or meta_changed:
-                log.debug(
-                    f"Upsert FOUND: {item.title} ({item.year}), "
-                    f"is_missing={is_missing}, is_stale={is_stale}, meta_changed={meta_changed}"
-                )
-                config.cache_manager.upsert(new_key, {"status": "found"}, item)
-                keys_to_upsert.append(new_key)
-            else:
-                log.debug(f"NO UPSERT NEEDED: {item.title} ({item.year}) - fully cached and unchanged.")
-
-        if config.quiet and progress_bar is not None:
-            progress.update(task, advance=1)
-        if enriched and raw_title_key in pending_matches:
-            del pending_matches[raw_title_key]
-        if item.type == "tv_series":
-            has_tvdb = getattr(item, "tvdb_id", None) or getattr(item, "new_tvdb_id", None)
-            if not has_tvdb:
-                TVDB_MISSING_CASES.append(
+            if not enriched:
+                item.match_failed = True
+                UNMATCHED_CASES.append(
                     {
+                        "media_type": item.type,
                         "title": item.title,
-                        "year": item.year,
+                        "year": item.year if item.year is not None else "",
                         "tmdb_id": getattr(item, "tmdb_id", ""),
+                        "tvdb_id": getattr(item, "tvdb_id", ""),
                         "imdb_id": getattr(item, "imdb_id", ""),
                         "files": ";".join(item.files),
+                        "match_reason": getattr(item, "match_reason", ""),
                     }
                 )
+                log.debug(f"Upsert NOT_FOUND: {item.title} ({item.year})")
+                config.cache_manager.upsert(cache_key, {"status": "not_found"}, item)
+                keys_to_upsert.append(cache_key)
+                if raw_title_key not in pending_matches:
+                    pending_matches[raw_title_key] = "add_tmdb_url_here"
+                if idx % 10 == 0 or idx == total_items:
+                    status.update(f"[green]Processing {idx}/{total_items} items...")
+                continue
+            else:
+                new_key = config.cache_manager.get_cache_key(item)
+                found_cache = config.cache.get(new_key)
+                meta_changed = (
+                    found_cache.get("title") != (item.new_title or item.title)
+                    or found_cache.get("year") != (item.new_year if item.new_year is not None else item.year)
+                    or found_cache.get("tmdb_id") != (item.new_tmdb_id or item.tmdb_id)
+                    or found_cache.get("tvdb_id") != (item.new_tvdb_id or item.tvdb_id)
+                    or found_cache.get("imdb_id") != (item.new_imdb_id or item.imdb_id)
+                )
+                is_missing = found_cache is None
+                is_stale = (
+                    found_cache is not None
+                    and not config.dry_run
+                    and not is_recent(found_cache.get("last_checked", ""), config)
+                )
+                if is_missing or is_stale or meta_changed:
+                    log.debug(
+                        f"Upsert FOUND: {item.title} ({item.year}), "
+                        f"is_missing={is_missing}, is_stale={is_stale}, meta_changed={meta_changed}"
+                    )
+                    config.cache_manager.upsert(new_key, {"status": "found"}, item)
+                    keys_to_upsert.append(new_key)
+                else:
+                    log.debug(f"NO UPSERT NEEDED: {item.title} ({item.year}) - fully cached and unchanged.")
 
-    # If status bar is still up at the end, close it
-    if status is not None:
-        status.__exit__(None, None, None)
+            if idx % 1 == 0 or idx == total_items:
+                status.update(f"[green]Processing {idx}/{total_items} items...")
+
+            if enriched and raw_title_key in pending_matches:
+                del pending_matches[raw_title_key]
+            if item.type == "tv_series":
+                has_tvdb = getattr(item, "tvdb_id", None) or getattr(item, "new_tvdb_id", None)
+                if not has_tvdb:
+                    TVDB_MISSING_CASES.append(
+                        {
+                            "title": item.title,
+                            "year": item.year,
+                            "tmdb_id": getattr(item, "tmdb_id", ""),
+                            "imdb_id": getattr(item, "imdb_id", ""),
+                            "files": ";".join(item.files),
+                        }
+                    )
 
     new_pending = update_pending_matches_from_cache(config)
     save_pending_matches(new_pending)
     config.pending_matches = new_pending
 
-    if config.quiet and config.show_unmatched and UNMATCHED_CASES:
+    # Only print unmatched cases if any exist
+    if config.show_unmatched and UNMATCHED_CASES:
         for case in UNMATCHED_CASES:
             title = case.get("title", "Unknown")
             log.warning(f"❌ Unmatched: {title}")
-    if config.quiet and progress_bar is not None:
-        progress_bar.__exit__(None, None, None)
-    log.info(f"✅ Completed metadata enrichment ({ignored_count} item(s) ignored by exclusion list)")
+    # Only print completed message if there were items processed or ignored
+    if total_items > 0 or ignored_count > 0:
+        log.info(f"✅ Completed metadata enrichment ({ignored_count} item(s) ignored by exclusion list)")
     return items
 
 
@@ -2084,7 +2055,10 @@ def rename_files(
     Returns grouped diff-style output once per media item.
     """
     mode = "DRY RUN" if config.dry_run else "LIVE"
-    log.info(f"🏷  Starting file rename process ({mode} mode)")
+    # Only print starting message if there are items to rename (i.e., not all are match_failed)
+    non_skipped_items = [item for item in items if not getattr(item, "match_failed", False)]
+    if len(non_skipped_items) > 0:
+        log.info(f"🏷  Starting file rename process ({mode} mode)")
     file_updates: list[tuple[str, str, str]] = []
     duplicate_log: list[dict[str, Any]] = []
     renamed, skipped = 0, 0
@@ -2092,150 +2066,162 @@ def rename_files(
     duplicates_dir = os.path.join(SCRIPT_DIR, "duplicates")
     os.makedirs(duplicates_dir, exist_ok=True)
 
-    for media_item in items:
-        if getattr(media_item, "match_failed", False):
-            continue
-
-        mtype = media_item.type
-        title = media_item.new_title or media_item.title
-        year = media_item.new_year if media_item.new_year is not None else media_item.year
-
-        if mtype == "tv_series":
-            label = "Series"
-        elif mtype == "collection":
-            label = "Collection"
-        else:
-            label = "Movie"
-
-        prefix = "[DRY RUN] " if config.dry_run else ""
-        header = f"{prefix}{label}: {title}"
-        if year:
-            header += f" ({year})"
-
-        key = config.cache_manager.get_cache_key(media_item)
-
-        for file_path in media_item.files:
-            directory, old_filename = os.path.split(file_path)
-            new_filename = generate_new_filename(media_item, old_filename)
-            new_path = os.path.join(directory, new_filename)
-
-            if len(new_filename) > 255:
-                log.warning(f"⛔ Skipped (too long): {new_filename}")
-                skipped += 1
+    with console.status("[cyan]Renaming files... Please wait.", spinner="dots"):
+        for media_item in items:
+            if getattr(media_item, "match_failed", False):
                 continue
 
-            if os.path.exists(new_path) and old_filename.lower() != new_filename.lower():
-                src_stat = os.stat(file_path)
-                dst_stat = os.stat(new_path)
-                src_ctime = getattr(src_stat, "st_ctime", src_stat.st_mtime)
-                dst_ctime = getattr(dst_stat, "st_ctime", dst_stat.st_mtime)
+            mtype = media_item.type
+            title = media_item.new_title or media_item.title
+            year = media_item.new_year if media_item.new_year is not None else media_item.year
 
-                if src_ctime >= dst_ctime:
-                    move_src = new_path
-                    move_dst_name = new_filename
-                    keep_path = file_path
-                else:
-                    move_src = file_path
-                    move_dst_name = old_filename
-                    keep_path = new_path
+            if mtype == "tv_series":
+                label = "Series"
+            elif mtype == "collection":
+                label = "Collection"
+            else:
+                label = "Movie"
 
-                if not os.path.exists(keep_path):
-                    log.warning(
-                        f"❗ [SAFEGUARD] Conflict detected but 'original' file '{os.path.basename(keep_path)}' does not exist in source. "
-                        f"Skipping move of '{os.path.basename(move_src)}' to duplicates to prevent data loss."
-                    )
+            prefix = "[DRY RUN] " if config.dry_run else ""
+            header = f"{prefix}{label}: {title}"
+            if year:
+                header += f" ({year})"
+
+            key = config.cache_manager.get_cache_key(media_item)
+
+            # To group per media item
+            item_renames = []
+
+            for file_path in media_item.files:
+                directory, old_filename = os.path.split(file_path)
+                new_filename = generate_new_filename(media_item, old_filename)
+                new_path = os.path.join(directory, new_filename)
+
+                if len(new_filename) > 255:
+                    log.warning(f"⛔ Skipped (too long): {new_filename}")
                     skipped += 1
                     continue
 
-                dest = os.path.join(duplicates_dir, os.path.basename(move_dst_name))
-                if os.path.exists(dest):
-                    base, ext = os.path.splitext(os.path.basename(move_dst_name))
-                    suffix = int(time.time())
-                    dest = os.path.join(duplicates_dir, f"{base}_{suffix}{ext}")
+                if os.path.exists(new_path) and old_filename.lower() != new_filename.lower():
+                    src_stat = os.stat(file_path)
+                    dst_stat = os.stat(new_path)
+                    src_ctime = getattr(src_stat, "st_ctime", src_stat.st_mtime)
+                    dst_ctime = getattr(dst_stat, "st_ctime", dst_stat.st_mtime)
 
-                if not config.dry_run:
-                    try:
-                        shutil.move(move_src, dest)
-                        log.warning(f"🗂️ Duplicate moved: {move_dst_name} → {dest}")
-                        duplicate_log.append(
-                            {
-                                "action": "moved",
-                                "kept_file": os.path.basename(keep_path),
-                                "kept_path": keep_path,
-                                "kept_ctime": src_ctime if move_src == new_path else dst_ctime,
-                                "moved_file": os.path.basename(move_dst_name),
-                                "moved_path": dest,
-                                "moved_ctime": src_ctime if move_src == file_path else dst_ctime,
-                            }
+                    if src_ctime >= dst_ctime:
+                        move_src = new_path
+                        move_dst_name = new_filename
+                        keep_path = file_path
+                    else:
+                        move_src = file_path
+                        move_dst_name = old_filename
+                        keep_path = new_path
+
+                    if not os.path.exists(keep_path):
+                        log.warning(
+                            f"❗ [SAFEGUARD] Conflict detected but 'original' file '{os.path.basename(keep_path)}' does not exist in source. "
+                            f"Skipping move of '{os.path.basename(move_src)}' to duplicates to prevent data loss."
                         )
-                    except Exception as e:
-                        log.error(f"❌ Failed to move duplicate '{move_dst_name}': {e}")
                         skipped += 1
                         continue
-                else:
-                    log.info(f"[DRY RUN] Would move duplicate: {move_dst_name} → {dest}", "YELLOW")
 
-                if src_ctime < dst_ctime:
-                    continue
+                    dest = os.path.join(duplicates_dir, os.path.basename(move_dst_name))
+                    if os.path.exists(dest):
+                        base, ext = os.path.splitext(os.path.basename(move_dst_name))
+                        suffix = int(time.time())
+                        dest = os.path.join(duplicates_dir, f"{base}_{suffix}{ext}")
 
-            if config.dry_run:
+                    if not config.dry_run:
+                        try:
+                            shutil.move(move_src, dest)
+                            log.warning(f"🗂️ Duplicate moved: {move_dst_name} → {dest}")
+                            duplicate_log.append(
+                                {
+                                    "action": "moved",
+                                    "kept_file": os.path.basename(keep_path),
+                                    "kept_path": keep_path,
+                                    "kept_ctime": src_ctime if move_src == new_path else dst_ctime,
+                                    "moved_file": os.path.basename(move_dst_name),
+                                    "moved_path": dest,
+                                    "moved_ctime": src_ctime if move_src == file_path else dst_ctime,
+                                }
+                            )
+                        except Exception as e:
+                            log.error(f"❌ Failed to move duplicate '{move_dst_name}': {e}")
+                            skipped += 1
+                            continue
+                    else:
+                        log.info(f"[DRY RUN] Would move duplicate: {move_dst_name} → {dest}", "YELLOW")
+
+                    if src_ctime < dst_ctime:
+                        continue
+
                 if old_filename != new_filename:
-                    log.info(header)
-                    log.info(f"        - {old_filename}", "RED")
-                    log.info(f"        + {new_filename}", "GREEN")
-                    file_updates.append((media_item.type, old_filename, new_filename))
-                    renamed += 1
-                continue
-
-            if old_filename != new_filename:
-                try:
-                    os.rename(file_path, new_path)
-                    log.info(header)
-                    log.info(f"        - {old_filename}", "RED")
-                    log.info(f"        + {new_filename}", "GREEN")
+                    item_renames.append((old_filename, new_filename))
                     file_updates.append((media_item.type, old_filename, new_filename))
                     renamed += 1
 
-                    cache_key = key
-                    cache_entry = config.cache.get(cache_key, {})
-                    hist = cache_entry.get("rename_history", [])
-                    hist.append(
-                        {
-                            "from": old_filename,
-                            "to": new_filename,
-                            "timestamp": datetime.now().isoformat(),
-                        }
-                    )
-                    cache_entry["rename_history"] = hist
+                    if not config.dry_run:
+                        try:
+                            os.rename(file_path, new_path)
+                            # Update cache only after successful rename
+                            cache_key = key
+                            cache_entry = config.cache.get(cache_key, {})
+                            hist = cache_entry.get("rename_history", [])
+                            hist.append(
+                                {
+                                    "from": old_filename,
+                                    "to": new_filename,
+                                    "timestamp": datetime.now().isoformat(),
+                                }
+                            )
+                            cache_entry["rename_history"] = hist
 
-                    origs = set(cache_entry.get("original_filenames", []))
-                    origs.add(old_filename)
-                    cache_entry["original_filenames"] = sorted(origs)
+                            origs = set(cache_entry.get("original_filenames", []))
+                            origs.add(old_filename)
+                            cache_entry["original_filenames"] = sorted(origs)
 
-                    real_files = (
-                        set(os.listdir(config.source_dir)) if os.path.isdir(config.source_dir) else set()
-                    )
-                    possibles = set(cache_entry["original_filenames"]) | {h["to"] for h in hist}
-                    cache_entry["current_filenames"] = sorted(f for f in possibles if f in real_files)
+                            real_files = (
+                                set(os.listdir(config.source_dir)) if os.path.isdir(config.source_dir) else set()
+                            )
+                            possibles = set(cache_entry["original_filenames"]) | {h["to"] for h in hist}
+                            cache_entry["current_filenames"] = sorted(f for f in possibles if f in real_files)
 
-                    config.cache[cache_key] = cache_entry
-                except Exception as e:
-                    log.error(f"❌ Failed to rename {old_filename}: {e}")
-                    skipped += 1
+                            config.cache[cache_key] = cache_entry
+                        except Exception as e:
+                            log.error(f"❌ Failed to rename {old_filename}: {e}")
+                            skipped += 1
+
+            # Print/group once per media item, but only if any renames happened
+            if item_renames:
+                log.info(header)
+                for old_filename, new_filename in item_renames:
+                    log.info(f"        - {old_filename}", "RED")
+                    log.info(f"        + {new_filename}", "GREEN")
+
     return file_updates, duplicate_log
+
+def flush_status():
+    global status_context, progress_context, progress_bar
+    # Flush Rich status spinner if active
+    if status_context is not None:
+        try:
+            status_context.__exit__(None, None, None)
+        except Exception:
+            pass
+        status_context = None
+    # Flush Rich progress bar if active
+    if progress_context is not None:
+        try:
+            progress_context.__exit__(None, None, None)
+        except Exception:
+            pass
+        progress_context = None
+        progress_bar = None
 
 
 def prune_orphaned_cache_entries(config: IdarrConfig) -> None:
-    """
-    Remove cache entries that are no longer associated with any files in the source directory.
-    Args:
-        config: The IdarrConfig instance, with source_dir and cache_manager.
-    Side effects:
-        Modifies the cache, deletes orphaned entries from SQLite.
-    """
-    from rich.console import Console
-
-    console = Console()
+    global status_context
     log.info("🧹 Starting prune operation for orphaned cache entries...")
 
     try:
@@ -2249,21 +2235,22 @@ def prune_orphaned_cache_entries(config: IdarrConfig) -> None:
     total = len(cache_items)
     entries_update = 10
 
-    with console.status("[cyan]Pruning orphaned cache entries...", spinner="dots") as status:
-        for idx, (key, entry) in enumerate(cache_items, 1):
-            originals = set(entry.get("original_filenames", []))
-            currents = set(entry.get("current_filenames", []))
-            relevant = originals | currents
-            if not (relevant & current_files):
-                log.info(
-                    f"🗑️ Pruning orphaned cache entry: {entry.get('title')} ({entry.get('year')}) [{key}]"
-                )
-                with sqlite3.connect(config.cache_manager.db_path) as conn:
-                    conn.execute("DELETE FROM cache WHERE key = ?", (key,))
-                    conn.commit()
-                removed_keys.append(key)
-            if idx % entries_update == 0 or idx == total:
-                status.update(f"[cyan]Searching, Please wait... ({idx:,}/{total:,})")
+    status_context = console.status("[cyan]Pruning orphaned cache entries...", spinner="dots")
+    status = status_context.__enter__()
+    for idx, (key, entry) in enumerate(cache_items, 1):
+        originals = set(entry.get("original_filenames", []))
+        currents = set(entry.get("current_filenames", []))
+        relevant = originals | currents
+        if not (relevant & current_files):
+            log.info(
+                f"🗑️ Pruning orphaned cache entry: {entry.get('title')} ({entry.get('year')}) [{key}]"
+            )
+            with sqlite3.connect(config.cache_manager.db_path) as conn:
+                conn.execute("DELETE FROM cache WHERE key = ?", (key,))
+                conn.commit()
+            removed_keys.append(key)
+        if idx % entries_update == 0 or idx == total:
+            status.update(f"[cyan]Searching, Please wait... ({idx:,}/{total:,})")
 
     for key in removed_keys:
         config.cache.pop(key, None)
@@ -2273,7 +2260,6 @@ def prune_orphaned_cache_entries(config: IdarrConfig) -> None:
 
 
 def print_rich_help() -> None:
-    console = Console()
     table = Table(show_header=True, header_style="bold purple")
     table.add_column("Option", style="green", no_wrap=True)
     table.add_column("Description", style="white")
@@ -2434,7 +2420,6 @@ def load_runtime_config(args: argparse.Namespace) -> IdarrConfig:
 
     if not config.tmdb_api_key:
         try:
-            console = Console()
             api_key = Prompt.ask(
                 "[bold yellow]TMDB API key not found. Please enter your TMDB API key[/bold yellow]"
             )
@@ -2458,6 +2443,7 @@ def load_runtime_config(args: argparse.Namespace) -> IdarrConfig:
     def _flush():
         try:
             pass
+            flush_status()
             config.cache_manager.save(set(config.cache_manager.cache.keys()))
         except Exception:
             pass
@@ -2475,7 +2461,6 @@ def load_runtime_config(args: argparse.Namespace) -> IdarrConfig:
 
 
 def print_settings(config: "IdarrConfig") -> None:
-    console = Console()
 
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Section", style="cyan", no_wrap=True)
@@ -2623,136 +2608,139 @@ def export_csvs(
         None
     """
 
-    def write_csv(path, rows, fieldnames):
-        if not rows:
-            return
-        with open(path, "w", newline="", encoding="utf-8") as csvfile:
-            writer = csv.DictWriter(
-                csvfile,
-                fieldnames=fieldnames,
-                quoting=csv.QUOTE_ALL,
+    with console.status("[cyan]Exporting CSVs... Please wait.", spinner="dots"):
+        def write_csv(path, rows, fieldnames):
+            if not rows:
+                return
+            with open(path, "w", newline="", encoding="utf-8") as csvfile:
+                writer = csv.DictWriter(
+                    csvfile,
+                    fieldnames=fieldnames,
+                    quoting=csv.QUOTE_ALL,
+                )
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+            # Only print if the file is actually written with data
+            if rows:
+                log.info(f"⚙️ CSV written to {path}")
+
+        updated_files_path = os.path.join(LOG_DIR, "updated_files.csv")
+        updated_files_fieldnames = [
+            "media_type",
+            "original_filename",
+            "new_filename",
+            "original_title",
+            "new_title",
+            "original_year",
+            "new_year",
+            "tmdb_id",
+            "new_tmdb_id",
+            "tvdb_id",
+            "new_tvdb_id",
+            "imdb_id",
+            "new_imdb_id",
+            "match_reason",
+        ]
+        updated_rows = []
+        for media_type, old_fn, new_fn in file_updates:
+            matched = next(
+                (
+                    item
+                    for item in updated_items
+                    if item.type == media_type and any(os.path.basename(fp) == old_fn for fp in item.files)
+                ),
+                None,
             )
-            writer.writeheader()
-            for row in rows:
-                writer.writerow(row)
-        log.info(f"⚙️ CSV written to {path}")
+            row = {
+                "media_type": media_type,
+                "original_filename": os.path.basename(old_fn),
+                "new_filename": os.path.basename(new_fn),
+                "original_title": getattr(matched, "title", ""),
+                "new_title": getattr(matched, "new_title", ""),
+                "original_year": getattr(matched, "year", ""),
+                "new_year": getattr(matched, "new_year", ""),
+                "tmdb_id": getattr(matched, "tmdb_id", ""),
+                "new_tmdb_id": getattr(matched, "new_tmdb_id", ""),
+                "tvdb_id": getattr(matched, "tvdb_id", ""),
+                "new_tvdb_id": getattr(matched, "new_tvdb_id", ""),
+                "imdb_id": getattr(matched, "imdb_id", ""),
+                "new_imdb_id": getattr(matched, "new_imdb_id", ""),
+                "match_reason": getattr(matched, "match_reason", ""),
+            }
+            updated_rows.append(row)
+        write_csv(updated_files_path, updated_rows, updated_files_fieldnames)
 
-    updated_files_path = os.path.join(LOG_DIR, "updated_files.csv")
-    updated_files_fieldnames = [
-        "media_type",
-        "original_filename",
-        "new_filename",
-        "original_title",
-        "new_title",
-        "original_year",
-        "new_year",
-        "tmdb_id",
-        "new_tmdb_id",
-        "tvdb_id",
-        "new_tvdb_id",
-        "imdb_id",
-        "new_imdb_id",
-        "match_reason",
-    ]
-    updated_rows = []
-    for media_type, old_fn, new_fn in file_updates:
-        matched = next(
-            (
-                item
-                for item in updated_items
-                if item.type == media_type and any(os.path.basename(fp) == old_fn for fp in item.files)
-            ),
-            None,
-        )
-        row = {
-            "media_type": media_type,
-            "original_filename": os.path.basename(old_fn),
-            "new_filename": os.path.basename(new_fn),
-            "original_title": getattr(matched, "title", ""),
-            "new_title": getattr(matched, "new_title", ""),
-            "original_year": getattr(matched, "year", ""),
-            "new_year": getattr(matched, "new_year", ""),
-            "tmdb_id": getattr(matched, "tmdb_id", ""),
-            "new_tmdb_id": getattr(matched, "new_tmdb_id", ""),
-            "tvdb_id": getattr(matched, "tvdb_id", ""),
-            "new_tvdb_id": getattr(matched, "new_tvdb_id", ""),
-            "imdb_id": getattr(matched, "imdb_id", ""),
-            "new_imdb_id": getattr(matched, "new_imdb_id", ""),
-            "match_reason": getattr(matched, "match_reason", ""),
-        }
-        updated_rows.append(row)
-    write_csv(updated_files_path, updated_rows, updated_files_fieldnames)
+        unmatched_cases_path = os.path.join(LOG_DIR, "unmatched_cases.csv")
+        unmatched_fieldnames = [
+            "files",
+            "title",
+            "year",
+            "media_type",
+            "tmdb_id",
+            "imdb_id",
+            "tvdb_id",
+            "match_reason",
+        ]
 
-    unmatched_cases_path = os.path.join(LOG_DIR, "unmatched_cases.csv")
-    unmatched_fieldnames = [
-        "files",
-        "title",
-        "year",
-        "media_type",
-        "tmdb_id",
-        "imdb_id",
-        "tvdb_id",
-        "match_reason",
-    ]
+        all_keys = set()
+        for case in UNMATCHED_CASES:
+            all_keys.update(case.keys())
+        unmatched_extra = [k for k in sorted(all_keys) if k not in unmatched_fieldnames]
+        final_unmatched_fieldnames = unmatched_fieldnames + unmatched_extra
 
-    all_keys = set()
-    for case in UNMATCHED_CASES:
-        all_keys.update(case.keys())
-    unmatched_extra = [k for k in sorted(all_keys) if k not in unmatched_fieldnames]
-    final_unmatched_fieldnames = unmatched_fieldnames + unmatched_extra
+        unmatched_rows = []
+        for case in UNMATCHED_CASES:
+            row = dict(case)
+            if "files" in row:
+                files = row["files"]
+                if isinstance(files, str):
+                    files = [f for f in files.split(";") if f]
+                elif not isinstance(files, list):
+                    files = []
+                row["files"] = ";".join(os.path.basename(f) for f in files)
+            unmatched_rows.append(row)
+        write_csv(unmatched_cases_path, unmatched_rows, final_unmatched_fieldnames)
 
-    unmatched_rows = []
-    for case in UNMATCHED_CASES:
-        row = dict(case)
-        if "files" in row:
-            files = row["files"]
-            if isinstance(files, str):
-                files = [f for f in files.split(";") if f]
-            elif not isinstance(files, list):
-                files = []
-            row["files"] = ";".join(os.path.basename(f) for f in files)
-        unmatched_rows.append(row)
-    write_csv(unmatched_cases_path, unmatched_rows, final_unmatched_fieldnames)
+        duplicates_csv_path = os.path.join(LOG_DIR, "duplicates_log.csv")
+        duplicate_fieldnames = [
+            "action",
+            "kept_file",
+            "kept_path",
+            "kept_ctime",
+            "moved_file",
+            "moved_path",
+            "moved_ctime",
+        ]
 
-    duplicates_csv_path = os.path.join(LOG_DIR, "duplicates_log.csv")
-    duplicate_fieldnames = [
-        "action",
-        "kept_file",
-        "kept_path",
-        "kept_ctime",
-        "moved_file",
-        "moved_path",
-        "moved_ctime",
-    ]
+        all_dupe_keys = set()
+        for entry in duplicate_log:
+            all_dupe_keys.update(entry.keys())
+        extra_dupe = [k for k in sorted(all_dupe_keys) if k not in duplicate_fieldnames]
+        final_duplicate_fieldnames = duplicate_fieldnames + extra_dupe
 
-    all_dupe_keys = set()
-    for entry in duplicate_log:
-        all_dupe_keys.update(entry.keys())
-    extra_dupe = [k for k in sorted(all_dupe_keys) if k not in duplicate_fieldnames]
-    final_duplicate_fieldnames = duplicate_fieldnames + extra_dupe
+        write_csv(duplicates_csv_path, duplicate_log, final_duplicate_fieldnames)
 
-    write_csv(duplicates_csv_path, duplicate_log, final_duplicate_fieldnames)
+        tvdb_missing_path = os.path.join(LOG_DIR, "tvdb_missing_cases.csv")
+        tvdb_missing_fieldnames = ["title", "year", "tmdb_id", "imdb_id", "files"]
+        all_tvdb_keys = set()
+        for entry in TVDB_MISSING_CASES:
+            all_tvdb_keys.update(entry.keys())
+        extra_tvdb = [k for k in sorted(all_tvdb_keys) if k not in tvdb_missing_fieldnames]
+        final_tvdb_fieldnames = tvdb_missing_fieldnames + extra_tvdb
 
-    tvdb_missing_path = os.path.join(LOG_DIR, "tvdb_missing_cases.csv")
-    tvdb_missing_fieldnames = ["title", "year", "tmdb_id", "imdb_id", "files"]
-    all_tvdb_keys = set()
-    for entry in TVDB_MISSING_CASES:
-        all_tvdb_keys.update(entry.keys())
-    extra_tvdb = [k for k in sorted(all_tvdb_keys) if k not in tvdb_missing_fieldnames]
-    final_tvdb_fieldnames = tvdb_missing_fieldnames + extra_tvdb
-
-    tvdb_rows = []
-    for entry in TVDB_MISSING_CASES:
-        row = dict(entry)
-        if "files" in row:
-            files = row["files"]
-            if isinstance(files, str):
-                files = [f for f in files.split(";") if f]
-            elif not isinstance(files, list):
-                files = []
-            row["files"] = ";".join(os.path.basename(f) for f in files)
-        tvdb_rows.append(row)
-    write_csv(tvdb_missing_path, tvdb_rows, final_tvdb_fieldnames)
+        tvdb_rows = []
+        for entry in TVDB_MISSING_CASES:
+            row = dict(entry)
+            if "files" in row:
+                files = row["files"]
+                if isinstance(files, str):
+                    files = [f for f in files.split(";") if f]
+                elif not isinstance(files, list):
+                    files = []
+                row["files"] = ";".join(os.path.basename(f) for f in files)
+            tvdb_rows.append(row)
+        write_csv(tvdb_missing_path, tvdb_rows, final_tvdb_fieldnames)
 
 
 def load_ignore_and_migrate_pending(config: "IdarrConfig") -> tuple[set[str], dict[str, Any]]:
@@ -2881,13 +2869,12 @@ def summarize_run(
         ("📡 TMDB API Calls", getattr(config, "_api_calls", 0)),
     ]
 
-    console_rich = Console()
     table = Table(show_header=False, box=None, padding=(0, 1))
     for label, value in labels:
         table.add_row(label, str(value))
-    console_rich.rule("[bold]Summary Report")
-    console_rich.print(table)
-    console_rich.rule()
+    console.rule("[bold]Summary Report")
+    console.print(table)
+    console.rule()
     log.info("Summary Report:", color="", console=False)
     for label, value in labels:
         log.info(f"{label}: {value}", color="", console=False)
@@ -2915,14 +2902,21 @@ def main():
 
     if config.log_level == "DEBUG":
         print_settings(config)
+
     if getattr(args, "revert", False):
         items = scan_files_in_flat_folder(config)
         items = filter_items(args, items)
-        perform_revert(config, items)
+        if items:
+            perform_revert(config, items)
         return
+
     start_time = time.time()
     items = scan_files_in_flat_folder(config)
     items = filter_items(args, items)
+    if not items:
+        # Avoid log output for empty runs
+        log.info("No items found to process. Exiting.")
+        return
     updated_items = handle_data(config, items)
     file_updates, duplicate_log = rename_files(updated_items, config)
     export_csvs(updated_items, file_updates, duplicate_log)
@@ -2936,7 +2930,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nInterrupted by user (Ctrl+C). Exiting gracefully.")
     except Exception as e:
-        console = Console()
         console.print("[bold red]💥 Unexpected error:[/bold red]", e)
         console.print(Traceback(show_locals=False))
         sys.exit(1)
