@@ -1229,37 +1229,25 @@ class IdarrConfig:
     _api_calls: int = 0
 
 
-def save_pending_matches(pending: dict[str, Optional[int]]) -> None:
+def save_pending_matches(pending_matches: dict, pending_file: str = PENDING_MATCHES_PATH):
     """
-    Save the pending matches dictionary to pending_matches.jsonc, preserving header comments.
-    Args:
-        pending: Dict mapping title keys to TMDB IDs or placeholders.
-    Side effects:
-        Writes to PENDING_MATCHES_PATH.
+    Write pending matches dict to pending_matches.jsonc with standard header.
     """
-    pending = dict(sorted(pending.items()))
-    os.makedirs(os.path.dirname(PENDING_MATCHES_PATH), exist_ok=True)
-    header_lines = []
-    if os.path.exists(PENDING_MATCHES_PATH):
-        with open(PENDING_MATCHES_PATH, encoding="utf-8") as f_in:
-            for line in f_in:
-                if line.lstrip().startswith("//"):
-                    header_lines.append(line.rstrip("\n"))
-                else:
-                    break
-    if not header_lines:
-        header_lines = [
-            '// List of pending matches in the form "Title (Year)": "add_tmdb_url_here",',
-            '// Replace "add_tmdb_url_here" with a TMDB URL, ID, or use "ignore" to send to ignored_titles.jsonc.',
-            "// Example:",
-            '// "Some Movie (2023)": "https://www.themoviedb.org/movie/12345"',
-            "",
-        ]
-    with open(PENDING_MATCHES_PATH, "w", encoding="utf-8") as f_out:
-        for comment in header_lines:
-            f_out.write(comment + "\n")
-        json.dump(pending, f_out, indent=2, ensure_ascii=False)
-        f_out.write("\n")
+    try:
+        with open(pending_file, "w", encoding="utf-8") as f:
+            f.write('// List of pending matches in the form "Title (Year)": "add_tmdb_url_here",\n')
+            f.write('// Replace "add_tmdb_url_here" with a TMDB URL, ID, or use "ignore" to send to ignored_titles.jsonc.\n')
+            f.write("// Example:\n")
+            f.write('// "Some Movie (2023)": "https://www.themoviedb.org/movie/12345"\n')
+            json.dump(
+                dict(sorted(pending_matches.items())),  # Sort by key
+                f,
+                indent=2,
+                ensure_ascii=False
+            )
+            f.write("\n")
+    except Exception as e:
+        log.warning(f"⚠️ Failed to save updated pending matches: {e}")
 
 
 def update_pending_matches_from_cache(config) -> dict[str, str]:
@@ -2166,7 +2154,20 @@ def prune_orphaned_cache_entries(config: IdarrConfig) -> None:
         log.error(f"Failed to list source directory: {e}")
         return
 
+    # Load pending matches
+    pending_file = PENDING_MATCHES_PATH
+    pending_matches = {}
+    if os.path.exists(pending_file):
+        with open(pending_file, encoding="utf-8") as f:
+            lines = [line for line in f if not line.lstrip().startswith("//")]
+            try:
+                pending_matches = json.loads("".join(lines))
+            except Exception as e:
+                log.warning(f"⚠️ Failed to load pending matches: {e}")
+                pending_matches = {}
+
     removed_keys = []
+    removed_titles = []
     cache_items = list(config.cache.items())
     total = len(cache_items)
     entries_update = 10
@@ -2183,6 +2184,12 @@ def prune_orphaned_cache_entries(config: IdarrConfig) -> None:
                 conn.execute("DELETE FROM cache WHERE key = ?", (key,))
                 conn.commit()
             removed_keys.append(key)
+            title = entry.get("title")
+            year = entry.get("year")
+            if year:
+                removed_titles.append(f"{title} ({year})")
+            else:
+                removed_titles.append(title)
         if idx % entries_update == 0 or idx == total:
             status.update(f"[cyan]Searching, Please wait... ({idx:,}/{total:,})")
 
@@ -2190,7 +2197,18 @@ def prune_orphaned_cache_entries(config: IdarrConfig) -> None:
         config.cache.pop(key, None)
         config.cache_manager.cache.pop(key, None)
 
-    log.info(f"✅ Prune operation complete. {len(removed_keys)} entries removed.")
+    # Remove pruned titles from pending_matches
+    pending_removed = 0
+    for removed_title in removed_titles:
+        if removed_title in pending_matches:
+            del pending_matches[removed_title]
+            log.info(f"🗑️ Pruned orphaned pending match: {removed_title}")
+            pending_removed += 1
+
+    # Save updated pending matches
+    save_pending_matches(pending_matches, pending_file)
+
+    log.info(f"✅ Prune operation complete. {len(removed_keys)} entries removed. {pending_removed} pending matches cleaned up.")
 
 
 def print_rich_help() -> None:
@@ -2797,19 +2815,7 @@ def load_ignore_and_sync_pending(config: "IdarrConfig") -> tuple[set[str], dict[
                             f"🔄 Restored '{was_ignored}' to pending_matches (removed from ignore list)."
                         )
 
-    # 5. Write updated pending matches back
-    try:
-        with open(pending_file, "w", encoding="utf-8") as f:
-            f.write('// List of pending matches in the form "Title (Year)": "add_tmdb_url_here",\n')
-            f.write(
-                '// Replace "add_tmdb_url_here" with a TMDB URL, ID, or use "ignore" to send to ignored_titles.jsonc.\n'
-            )
-            f.write("// Example:\n")
-            f.write('// "Some Movie (2023)": "https://www.themoviedb.org/movie/12345"\n')
-            json.dump(pending_matches, f, indent=2, ensure_ascii=False)
-            f.write("\n")
-    except Exception as e:
-        log.warning(f"⚠️ Failed to save updated pending matches: {e}")
+    save_pending_matches(pending_matches, pending_file)
 
     return ignored_title_keys, pending_matches
 
@@ -2997,7 +3003,7 @@ def resolve_pending_matches(config):
 
     if updated:
         config.cache = config.cache_manager.cache
-    save_pending_matches(pending)
+    save_pending_matches(pending, PENDING_MATCHES_PATH)
 
 
 def summarize_run(
