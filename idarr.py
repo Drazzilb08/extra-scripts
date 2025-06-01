@@ -1818,7 +1818,7 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
             raw_title_key = f"{item.title} ({item.year})" if item.year else item.title
             cache_key = config.cache_manager.get_cache_key(item)
 
-            if raw_title_key in ignored_title_keys:
+            if is_ignored(item, ignored_title_keys):
                 log.debug(f"⏭️ Ignored by user-defined exclusions: {raw_title_key}")
                 if raw_title_key in pending_matches:
                     del pending_matches[raw_title_key]
@@ -1960,6 +1960,13 @@ def generate_new_filename(media_item: "MediaItem", old_filename: str) -> str:
     cleaned = " ".join(cleaned.split()).strip()
     return cleaned
 
+def is_ignored(media_item, ignored_title_keys):
+    """
+    Returns True if the media_item should be ignored (by raw title key), False otherwise.
+    """
+    raw_title_key = f"{media_item.title} ({media_item.year})" if media_item.year else media_item.title
+    return raw_title_key in ignored_title_keys
+
 
 def rename_files(
     items: list["MediaItem"], config: "IdarrConfig"
@@ -1984,6 +1991,14 @@ def rename_files(
 
     with console.status("[cyan]Renaming files... Please wait.", spinner="dots"):
         for media_item in items:
+            # User-defined ignore check
+            if is_ignored(media_item, getattr(config, "ignored_title_keys", set())):
+                log.debug(
+                    f"⏭️ Ignored by user-defined exclusions (rename skipped): {media_item.title} ({media_item.year})"
+                    if media_item.year else media_item.title
+                )
+                continue
+
             if getattr(media_item, "match_failed", False):
                 continue
 
@@ -2018,7 +2033,12 @@ def rename_files(
                     continue
 
                 if os.path.exists(new_path) and old_filename.lower() != new_filename.lower():
-                    src_stat = os.stat(file_path)
+                    try:
+                        src_stat = os.stat(file_path)
+                    except FileNotFoundError:
+                        log.warning(f"❌ Source file not found, skipping: {file_path}")
+                        skipped += 1
+                        continue
                     dst_stat = os.stat(new_path)
                     src_ctime = getattr(src_stat, "st_ctime", src_stat.st_mtime)
                     dst_ctime = getattr(dst_stat, "st_ctime", dst_stat.st_mtime)
@@ -2797,15 +2817,16 @@ def load_ignore_and_sync_pending(config: "IdarrConfig") -> tuple[set[str], dict[
 def resolve_pending_matches(config):
     """
     Resolve pending matches by updating cache with user-supplied TMDB URLs/IDs.
-    - Updates cache, moves entries, enriches as needed.
-    - Handles ignored and deleted entries.
+    - Always uses the canonical TMDB title/type for the match, not the original pending key.
+    - Logs retitling if the TMDB title differs from the pending match key.
+    - Removes the old entry using the original key from the cache after upsert.
+    - Only supports simple "Old Base Name": "tmdb_url" mapping.
     Side effects:
         Modifies cache, writes to IGNORE and PENDING files, updates SQLite.
     """
     ignored = set()
     existing = []
     if os.path.exists(IGNORED_TITLES_PATH):
-
         with open(IGNORED_TITLES_PATH, encoding="utf-8") as f:
             lines = f.readlines()
         content_lines = [line for line in lines if not line.lstrip().startswith("//")]
@@ -2835,7 +2856,7 @@ def resolve_pending_matches(config):
         if value == "ignore":
             m = re.match(r"^(.*?)(?: \((\d{4})\))?$", key)
             title = m.group(1)
-            year = int(m.group(2)) if m.group(2) else None
+            year = int(m.group(2)) if m and m.group(2) else None
             for cache_key, entry in config.cache.items():
                 if entry.get("title") == title and (
                     entry.get("year") == year or (year is None and not entry.get("year"))
@@ -2858,9 +2879,24 @@ def resolve_pending_matches(config):
             del pending[key]
             continue
         if value and value != "add_tmdb_url_here":
+            # Parse TMDB type and ID from URL if present
+            pending_type = None
             tmdb_id = None
-            if isinstance(value, str):
-                m = re.search(r"(\d+)", value)
+            if isinstance(value, str) and "themoviedb.org" in value:
+                # Determine type from URL
+                if "/tv/" in value:
+                    pending_type = "tv_series"
+                elif "/movie/" in value:
+                    pending_type = "movie"
+                elif "/collection/" in value:
+                    pending_type = "collection"
+                # Extract TMDB ID
+                m = re.search(r"/(tv|movie|collection)/(\d+)", value)
+                if m:
+                    tmdb_id = int(m.group(2))
+            else:
+                # Fall back to previous behavior
+                m = re.search(r"(\d+)", value) if isinstance(value, str) else None
                 if m:
                     tmdb_id = int(m.group(1))
             if not tmdb_id:
@@ -2869,7 +2905,7 @@ def resolve_pending_matches(config):
 
             m = re.match(r"^(.*?)(?: \((\d{4})\))?$", key)
             title = m.group(1)
-            year = int(m.group(2)) if m.group(2) else None
+            year = int(m.group(2)) if m and m.group(2) else None
 
             old_key = None
             entry = None
@@ -2884,9 +2920,10 @@ def resolve_pending_matches(config):
                 del pending[key]
                 continue
 
+            # Use TMDB canonical title/type for the match
             media_item = MediaItem(
                 config=config,
-                type=entry.get("type", "movie"),
+                type=pending_type if pending_type else entry.get("type", "movie"),
                 title=entry.get("title"),
                 year=entry.get("year"),
                 tmdb_id=tmdb_id,
@@ -2895,13 +2932,31 @@ def resolve_pending_matches(config):
                 files=entry.get("current_filenames", []),
             )
             media_item.enrich()
-            new_key = config.cache_manager.get_cache_key(media_item)
+            # Always use canonical TMDB title/year/type for the updated entry
             resolved_title = media_item.new_title or media_item.title
             resolved_year = media_item.new_year if media_item.new_year is not None else media_item.year
             resolved_tmdb_id = (
                 media_item.new_tmdb_id if media_item.new_tmdb_id is not None else media_item.tmdb_id
             )
             resolved_type = media_item.type
+            new_key = config.cache_manager.get_cache_key(
+                MediaItem(
+                    config=config,
+                    type=resolved_type,
+                    title=resolved_title,
+                    year=resolved_year,
+                    tmdb_id=resolved_tmdb_id,
+                    tvdb_id=media_item.new_tvdb_id or media_item.tvdb_id,
+                    imdb_id=media_item.new_imdb_id or media_item.imdb_id,
+                    files=media_item.files,
+                )
+            )
+
+            # Log a clear retitling message if TMDB title differs from pending match key
+            if key != (media_item.new_title or media_item.title):
+                log.info(
+                    f"🔄 Retitling '{key}' → '{media_item.new_title or media_item.title}' (from TMDB metadata)"
+                )
 
             config.cache_manager.upsert(
                 new_key,
@@ -2916,6 +2971,7 @@ def resolve_pending_matches(config):
                     "last_checked": datetime.now().isoformat(),
                 },
             )
+            # Remove the old entry using the original key from the cache after upsert
             if old_key in config.cache_manager.cache:
                 config.cache_manager.cache.pop(old_key)
             with sqlite3.connect(config.cache_manager.db_path) as conn:
