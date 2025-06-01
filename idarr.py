@@ -1236,15 +1236,12 @@ def save_pending_matches(pending_matches: dict, pending_file: str = PENDING_MATC
     try:
         with open(pending_file, "w", encoding="utf-8") as f:
             f.write('// List of pending matches in the form "Title (Year)": "add_tmdb_url_here",\n')
-            f.write('// Replace "add_tmdb_url_here" with a TMDB URL, ID, or use "ignore" to send to ignored_titles.jsonc.\n')
+            f.write(
+                '// Replace "add_tmdb_url_here" with a TMDB URL, ID, or use "ignore" to send to ignored_titles.jsonc.\n'
+            )
             f.write("// Example:\n")
             f.write('// "Some Movie (2023)": "https://www.themoviedb.org/movie/12345"\n')
-            json.dump(
-                dict(sorted(pending_matches.items())),  # Sort by key
-                f,
-                indent=2,
-                ensure_ascii=False
-            )
+            json.dump(dict(sorted(pending_matches.items())), f, indent=2, ensure_ascii=False)  # Sort by key
             f.write("\n")
     except Exception as e:
         log.warning(f"⚠️ Failed to save updated pending matches: {e}")
@@ -1948,6 +1945,7 @@ def generate_new_filename(media_item: "MediaItem", old_filename: str) -> str:
     cleaned = " ".join(cleaned.split()).strip()
     return cleaned
 
+
 def is_ignored(media_item, ignored_title_keys):
     """
     Returns True if the media_item should be ignored (by raw title key), False otherwise.
@@ -1983,7 +1981,8 @@ def rename_files(
             if is_ignored(media_item, getattr(config, "ignored_title_keys", set())):
                 log.debug(
                     f"⏭️ Ignored by user-defined exclusions (rename skipped): {media_item.title} ({media_item.year})"
-                    if media_item.year else media_item.title
+                    if media_item.year
+                    else media_item.title
                 )
                 continue
 
@@ -2208,7 +2207,9 @@ def prune_orphaned_cache_entries(config: IdarrConfig) -> None:
     # Save updated pending matches
     save_pending_matches(pending_matches, pending_file)
 
-    log.info(f"✅ Prune operation complete. {len(removed_keys)} entries removed. {pending_removed} pending matches cleaned up.")
+    log.info(
+        f"✅ Prune operation complete. {len(removed_keys)} entries removed. {pending_removed} pending matches cleaned up."
+    )
 
 
 def print_rich_help() -> None:
@@ -2958,11 +2959,11 @@ def resolve_pending_matches(config):
                 )
             )
 
-            # Log a clear retitling message if TMDB title differs from pending match key
-            if key != (media_item.new_title or media_item.title):
-                log.info(
-                    f"🔄 Retitling '{key}' → '{media_item.new_title or media_item.title}' (from TMDB metadata)"
-                )
+            original_title = media_item.title
+            new_title = media_item.new_title
+
+            if new_title and new_title != original_title:
+                log.info(f"🔄 Retitling '{original_title}' → '{new_title}' (from TMDB metadata)")
 
             config.cache_manager.upsert(
                 new_key,
