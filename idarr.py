@@ -789,7 +789,15 @@ class TMDBQueryService:
                 if m_type == "movie":
                     result = self.client._api.movies_get_details(tmdb_id)
                 elif m_type == "tv_series":
-                    result = self.client._api.tv_get_details(tmdb_id)
+                    # Fetch main show object
+                    show = self.client._api.tv_get_details(tmdb_id)
+                    # Hydrate with external_ids
+                    if show and isinstance(show, dict):
+                        external_ids = self.client._api.tv_get_external_ids(tmdb_id)
+                        if external_ids:
+                            show["imdb_id"] = external_ids.get("imdb_id")
+                            show["tvdb_id"] = external_ids.get("tvdb_id")
+                    result = show
                 elif m_type == "collection":
                     result = self.client._api.collections_get_details(tmdb_id)
 
@@ -841,6 +849,64 @@ class TMDBQueryService:
             except Exception:
                 continue
         return None
+
+    def rehydrate_missing_tvdb_ids(self, cache, max_age_days=7):
+        """
+        For all TV series in the cache missing a tvdb_id and not checked recently,
+        attempt to rehydrate from TMDB.
+        Side effect: Updates cache entries in-place.
+        """
+        now = datetime.now()
+        updated = 0
+        stale_delta = timedelta(days=max_age_days)
+
+        for cache_key, entry in cache.items():
+            if entry.get("type") == "tv_series" and not entry.get("tvdb_id"):
+                last_checked = entry.get("last_checked")
+                stale = True
+                if last_checked:
+                    try:
+                        checked_dt = (
+                            datetime.strptime(last_checked, "%Y-%m-%d %H:%M:%S")
+                            if isinstance(last_checked, str)
+                            else last_checked
+                        )
+                        if now - checked_dt < stale_delta:
+                            stale = False
+                    except Exception:
+                        pass
+                if not stale:
+                    continue  # Skip if checked recently
+
+                tmdb_id = entry.get("tmdb_id")
+                if tmdb_id:
+                    log.debug(
+                        f"🔄 Rehydrating TV series missing tvdb_id (stale): {entry.get('title')} [{tmdb_id}]"
+                    )
+                    try:
+                        result = self._fetch_by_tmdb_id(
+                            search=type(
+                                "S",
+                                (),
+                                {
+                                    "tmdb_id": tmdb_id,
+                                    "title": entry.get("title"),
+                                    "year": entry.get("year"),
+                                },
+                            )(),
+                            media_type="tv_series",
+                        )
+                        if result:
+                            entry["tvdb_id"] = getattr(result, "tvdb_id", None)
+                            entry["imdb_id"] = getattr(result, "imdb_id", None)
+                            entry["last_checked"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                            updated += 1
+                    except Exception as e:
+                        log.warning(f"Failed to rehydrate {entry.get('title')} [{tmdb_id}]: {e}")
+        if updated == 0:
+            log.info("✅ No stale TV series missing tvdb_id needed rehydration.")
+        else:
+            log.info(f"✅ Rehydrated {updated} TV series entries missing tvdb_id (stale only).")
 
     def _fuzzy_match_candidates(
         self,
@@ -1207,6 +1273,7 @@ class IdarrConfig:
     source_dir: Optional[str] = None
     tmdb_api_key: Optional[str] = None
     frequency_days: int = field(default_factory=lambda: int(os.environ.get("FREQUENCY_DAYS", "30")))
+    tvdb_frequency: int = field(default_factory=lambda: int(os.environ.get("TVDB_FREQUENCY", "30")))
     cache_path: str = field(default_factory=lambda: os.path.join(SCRIPT_DIR, "cache", "idarr_cache.json"))
     no_cache: bool = False
     clear_cache: bool = False
@@ -2233,6 +2300,7 @@ def print_rich_help() -> None:
     # Caching Options
     table.add_row("[bold]Caching Options[/bold]", "")
     table.add_row("--frequency-days DAYS", "Days before cache entries are considered stale")
+    table.add_row("--tvdb-frequency DAYS", "Days before re-searching for items w/o TVDb IDs")
     table.add_row("--clear-cache", "Delete the existing metadata cache before running")
     table.add_row("--cache-path PATH", "Specify a custom cache file path")
     table.add_row("--no-cache", "Skip loading or saving the cache")
@@ -2268,6 +2336,13 @@ def print_rich_help() -> None:
     console.print("  python idarr.py --filter --type movie --year 2023")
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.lower() in ("1", "true", "yes", "on")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Enrich and rename media image files using TMDB metadata.",
@@ -2278,7 +2353,11 @@ def parse_args() -> argparse.Namespace:
 
     general = parser.add_argument_group("General Options")
     general.add_argument(
-        "--source", metavar="DIR", type=str, default=os.environ.get("SOURCE_DIR"), help=argparse.SUPPRESS
+        "--source",
+        metavar="DIR",
+        type=str,
+        default=os.environ.get("SOURCE_DIR"),
+        help=argparse.SUPPRESS,
     )
     general.add_argument(
         "--tmdb-api-key",
@@ -2287,22 +2366,50 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("TMDB_API_KEY"),
         help=argparse.SUPPRESS,
     )
-    general.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
-    general.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
-    general.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
-    general.add_argument("--limit", metavar="N", type=int, help=argparse.SUPPRESS)
-    general.add_argument("--remove-non-image-files", action="store_true", help=argparse.SUPPRESS)
+    general.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=env_bool("DRY_RUN", False),
+        help=argparse.SUPPRESS,
+    )
+    general.add_argument(
+        "--quiet",
+        action="store_true",
+        default=env_bool("QUIET", False),
+        help=argparse.SUPPRESS,
+    )
+    general.add_argument(
+        "--debug",
+        action="store_true",
+        default=env_bool("DEBUG", False),
+        help=argparse.SUPPRESS,
+    )
+    general.add_argument(
+        "--limit",
+        metavar="N",
+        type=int,
+        default=int(os.environ.get("LIMIT", 0)) if os.environ.get("LIMIT") else None,
+        help=argparse.SUPPRESS,
+    )
+    general.add_argument(
+        "--remove-non-image-files",
+        action="store_true",
+        default=env_bool("REMOVE_NON_IMAGE_FILES", False),
+        help=argparse.SUPPRESS,
+    )
     general.add_argument(
         "--ignore-file",
         metavar="PATH",
         type=str,
-        default=os.path.join(LOG_DIR, "ignored_titles.jsonc"),
+        default=os.environ.get("IGNORE_FILE", os.path.join(LOG_DIR, "ignored_titles.jsonc")),
         help=argparse.SUPPRESS,
     )
     general.add_argument(
-        "--pending-matches",
-        action="store_true",
-        help="Only process and resolve pending matches (including renaming just-resolved entries).",
+        "--pending-matches-path",
+        metavar="PATH",
+        type=str,
+        default=os.environ.get("PENDING_MATCHES_PATH", PENDING_MATCHES_PATH),
+        help=argparse.SUPPRESS,
     )
 
     cache = parser.add_argument_group("Caching Options")
@@ -2313,29 +2420,57 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("FREQUENCY_DAYS", "30")),
         help=argparse.SUPPRESS,
     )
-    cache.add_argument("--clear-cache", action="store_true", help=argparse.SUPPRESS)
-    cache.add_argument("--cache-path", metavar="PATH", type=str, default=CACHE_PATH, help=argparse.SUPPRESS)
-    cache.add_argument("--no-cache", action="store_true", help=argparse.SUPPRESS)
+    cache.add_argument(
+        "--tvdb-frequency",
+        metavar="DAYS",
+        type=int,
+        default=int(os.environ.get("TVDB_FREQUENCY", "7")),
+        help=argparse.SUPPRESS,
+    )
+    cache.add_argument(
+        "--clear-cache",
+        action="store_true",
+        default=env_bool("CLEAR_CACHE", False),
+        help=argparse.SUPPRESS,
+    )
+    cache.add_argument(
+        "--cache-path",
+        metavar="PATH",
+        type=str,
+        default=os.environ.get("CACHE_PATH", CACHE_PATH),
+        help=argparse.SUPPRESS,
+    )
+    cache.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=env_bool("NO_CACHE", False),
+        help=argparse.SUPPRESS,
+    )
     cache.add_argument(
         "--prune",
         action="store_true",
+        default=env_bool("PRUNE", False),
         help="Prune cache entries not associated with any file in the source directory.",
     )
     cache.add_argument(
-        "--purge", type=str, help='Delete cache entries by TMDB ID or by "Title (Year)" or "Title"'
+        "--purge",
+        type=str,
+        help='Delete cache entries by TMDB ID or by "Title (Year)" or "Title"',
     )
 
-    filtering = parser.add_argument_group("Filtering Options")
-    filtering.add_argument("--filter", action="store_true", help=argparse.SUPPRESS)
-    filtering.add_argument("--type", choices=["movie", "tv_series", "collection"], help=argparse.SUPPRESS)
-    filtering.add_argument("--year", metavar="YEAR", type=int, help=argparse.SUPPRESS)
-    filtering.add_argument("--contains", metavar="TEXT", type=str, help=argparse.SUPPRESS)
-    filtering.add_argument("--id", metavar="ID", type=str, help=argparse.SUPPRESS)
-    filtering.add_argument("--skip-collections", action="store_true", help=argparse.SUPPRESS)
-
     extra = parser.add_argument_group("Export & Recovery")
-    extra.add_argument("--show-unmatched", action="store_true", help=argparse.SUPPRESS)
-    extra.add_argument("--revert", action="store_true", help=argparse.SUPPRESS)
+    extra.add_argument(
+        "--show-unmatched",
+        action="store_true",
+        default=env_bool("SHOW_UNMATCHED", False),
+        help=argparse.SUPPRESS,
+    )
+    extra.add_argument(
+        "--revert",
+        action="store_true",
+        default=env_bool("REVERT", False),
+        help=argparse.SUPPRESS,
+    )
 
     args = parser.parse_args()
     if getattr(args, "help", False):
@@ -2346,15 +2481,33 @@ def parse_args() -> argparse.Namespace:
 
 def load_runtime_config(args: argparse.Namespace) -> IdarrConfig:
     config = IdarrConfig()
+
+    # General and main runtime flags
     config.dry_run = getattr(args, "dry_run", False)
     config.quiet = getattr(args, "quiet", False)
-    config.source_dir = args.source or os.environ.get("SOURCE_DIR")
-    config.tmdb_api_key = args.tmdb_api_key or os.environ.get("TMDB_API_KEY")
     config.log_level = "DEBUG" if getattr(args, "debug", False) else "INFO"
     log.configure(quiet=config.quiet, level=config.log_level)
-    config.frequency_days = getattr(args, "frequency_days", None)
-    if config.frequency_days is None:
-        config.frequency_days = int(os.environ.get("FREQUENCY_DAYS", "30"))
+
+    config.source_dir = getattr(args, "source", None) or os.environ.get("SOURCE_DIR") or ""
+    config.tmdb_api_key = getattr(args, "tmdb_api_key", None) or os.environ.get("TMDB_API_KEY") or ""
+    config.limit = (
+        getattr(args, "limit", None)
+        if getattr(args, "limit", None) is not None
+        else (int(os.environ.get("LIMIT")) if os.environ.get("LIMIT") else None)
+    )
+    config.remove_non_image_files = getattr(args, "remove_non_image_files", False)
+    config.ignore_file = (
+        getattr(args, "ignore_file", None)
+        or os.environ.get("IGNORE_FILE")
+        or os.path.join(LOG_DIR, "ignored_titles.jsonc")
+    )
+    config.pending_matches_path = (
+        getattr(args, "pending_matches_path", None)
+        or os.environ.get("PENDING_MATCHES_PATH")
+        or PENDING_MATCHES_PATH
+    )
+
+    # Caching
     config.cache_path = (
         getattr(args, "cache_path", None)
         or os.environ.get("CACHE_PATH")
@@ -2362,18 +2515,32 @@ def load_runtime_config(args: argparse.Namespace) -> IdarrConfig:
     )
     config.no_cache = getattr(args, "no_cache", False)
     config.clear_cache = getattr(args, "clear_cache", False)
-    config.remove_non_image_files = getattr(args, "remove_non_image_files", False)
-    config.limit = getattr(args, "limit", None)
+    config.frequency_days = (
+        getattr(args, "frequency_days", None)
+        if getattr(args, "frequency_days", None) is not None
+        else int(os.environ.get("FREQUENCY_DAYS", "30"))
+    )
+    config.tvdb_frequency = (
+        getattr(args, "tvdb_frequency", None)
+        if getattr(args, "tvdb_frequency", None) is not None
+        else int(os.environ.get("TVDB_FREQUENCY", "7"))
+    )
+    config.prune = getattr(args, "prune", False)
+    config.purge = getattr(args, "purge", False)
+
+    # Export/Recovery
+    config.show_unmatched = getattr(args, "show_unmatched", False)
+    config.revert = getattr(args, "revert", False)
+
+    # Filtering (not included in .env, but support CLI as normal)
     config.filter = getattr(args, "filter", False)
     config.type = getattr(args, "type", None)
     config.year = getattr(args, "year", None)
     config.contains = getattr(args, "contains", None)
     config.id = getattr(args, "id", None)
-    config.show_unmatched = getattr(args, "show_unmatched", False)
-    config.revert = getattr(args, "revert", False)
     config.skip_collections = getattr(args, "skip_collections", False)
-    config.ignore_file = getattr(args, "ignore_file", None)
 
+    # Cache manager
     config.cache_manager = SQLiteCacheManager(
         path=config.cache_path, source_dir=config.source_dir, no_cache=config.no_cache
     )
@@ -2381,6 +2548,7 @@ def load_runtime_config(args: argparse.Namespace) -> IdarrConfig:
         os.remove(config.cache_path)
     config.cache = config.cache_manager.load()
 
+    # TMDB API key prompt (last chance)
     if not config.tmdb_api_key:
         try:
             api_key = Prompt.ask(
@@ -2400,12 +2568,12 @@ def load_runtime_config(args: argparse.Namespace) -> IdarrConfig:
         raise RuntimeError(
             "TMDB API key is required. Set via --tmdb-api-key or TMDB_API_KEY environment variable."
         )
+
     tmdb_client = TMDbAPIs(config.tmdb_api_key)
     config.tmdb_query_service = TMDBQueryService(tmdb_client, config)
 
     def _flush():
         try:
-            pass
             flush_status()
             config.cache_manager.save(set(config.cache_manager.cache.keys()))
         except Exception:
@@ -2424,31 +2592,42 @@ def load_runtime_config(args: argparse.Namespace) -> IdarrConfig:
 
 
 def print_settings(config: "IdarrConfig") -> None:
-
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Section", style="cyan", no_wrap=True)
     table.add_column("Setting", style="green")
     table.add_column("Value", style="white")
 
     settings = []
+    # General
     settings.append(("General", "SOURCE_DIR", str(config.source_dir)))
     settings.append(("General", "DRY_RUN", str(getattr(config, "dry_run", False))))
     settings.append(("General", "QUIET", str(getattr(config, "quiet", False))))
     settings.append(("General", "LOG_LEVEL", str(getattr(config, "log_level", "INFO"))))
     settings.append(("General", "LIMIT", str(getattr(config, "limit", None))))
+    settings.append(
+        ("General", "REMOVE_NON_IMAGE_FILES", str(getattr(config, "remove_non_image_files", False)))
+    )
+    settings.append(("General", "IGNORE_FILE", str(getattr(config, "ignore_file", ""))))
+    settings.append(("General", "PENDING_MATCHES_PATH", str(PENDING_MATCHES_PATH)))
 
+    # Caching
     settings.append(("Caching", "CACHE_PATH", str(getattr(config, "cache_path", ""))))
     settings.append(("Caching", "NO_CACHE", str(getattr(config, "no_cache", False))))
     settings.append(("Caching", "CLEAR_CACHE", str(getattr(config, "clear_cache", False))))
     settings.append(("Caching", "FREQUENCY_DAYS", str(getattr(config, "frequency_days", 30))))
+    settings.append(("Caching", "TVDB_FREQUENCY", str(getattr(config, "tvdb_frequency", 7))))
     settings.append(("Caching", "PRUNE", str(getattr(config, "prune", False))))
     settings.append(("Caching", "PURGE", str(getattr(config, "purge", False))))
+    settings.append(("Caching", "CACHE_ENTRIES", str(len(getattr(config, "cache", {})))))
 
+    # Export/Recovery
     settings.append(("Export/Recovery", "SHOW_UNMATCHED", str(getattr(config, "show_unmatched", False))))
     settings.append(("Export/Recovery", "REVERT", str(getattr(config, "revert", False))))
 
+    # TMDB
     settings.append(("TMDB", "TMDB_API_KEY", "********" if getattr(config, "tmdb_api_key", None) else None))
 
+    # Filtering
     if getattr(config, "filter", False):
         settings.append(("Filtering", "FILTER", "True"))
         if getattr(config, "type", None) is not None:
@@ -2460,13 +2639,17 @@ def print_settings(config: "IdarrConfig") -> None:
         if getattr(config, "id", None) is not None:
             settings.append(("Filtering", "ID", str(config.id)))
 
-    console.print("[bold blue]🔧 Current Settings[/bold blue]\n")
+    # Paths (optional/for debugging)
+    if hasattr(config, "script_dir"):
+        settings.append(("Paths", "SCRIPT_DIR", str(config.script_dir)))
+    if hasattr(config, "log_dir"):
+        settings.append(("Paths", "LOG_DIR", str(config.log_dir)))
 
+    console.print("[bold blue]🔧 Current Settings[/bold blue]\n")
     for section, setting, value in settings:
         table.add_row(section, setting, value)
 
     if config.log_level == "DEBUG":
-
         section_width = max(len(str(s[0])) for s in settings + [("Section", "", "")])
         setting_width = max(len(str(s[1])) for s in settings + [("", "Setting", "")])
         value_width = max(len(str(s[2])) if s[2] is not None else 0 for s in settings + [("", "", "Value")])
@@ -2480,7 +2663,6 @@ def print_settings(config: "IdarrConfig") -> None:
             log.debug(
                 f"{section.ljust(section_width)} | {setting.ljust(setting_width)} | {val_str.ljust(value_width)}"
             )
-
     console.print(table)
 
 
@@ -3133,9 +3315,9 @@ def main():
 
     if config.log_level == "DEBUG":
         print_settings(config)
-
     start_time = time.time()
     items = scan_files_in_flat_folder(config)
+    config.tmdb_query_service.rehydrate_missing_tvdb_ids(config.cache, max_age_days=config.tvdb_frequency)
     items = filter_items(args, items)
     if not items:
         log.info("No items found to process. Exiting.")
