@@ -1303,156 +1303,6 @@ def is_recent(last_checked: str, config: "IdarrConfig") -> bool:
         return False
 
 
-def resolve_pending_matches(config):
-    """
-    Resolve pending matches by updating cache with user-supplied TMDB URLs/IDs.
-    - Updates cache, moves entries, enriches as needed.
-    - Handles ignored and deleted entries.
-    Side effects:
-        Modifies cache, writes to IGNORE and PENDING files, updates SQLite.
-    """
-    ignored = set()
-    existing = []
-    if os.path.exists(IGNORED_TITLES_PATH):
-
-        with open(IGNORED_TITLES_PATH, encoding="utf-8") as f:
-            lines = f.readlines()
-        content_lines = [line for line in lines if not line.lstrip().startswith("//")]
-        try:
-            data = json.loads("".join(content_lines))
-            if isinstance(data, list):
-                existing = data
-                ignored.update(existing)
-        except (json.JSONDecodeError, ValueError):
-            existing = []
-    config.ignored_title_keys = set(existing)
-
-    if not os.path.exists(PENDING_MATCHES_PATH):
-        return
-
-    with open(PENDING_MATCHES_PATH, encoding="utf-8") as f:
-        lines = f.readlines()
-    content_lines = [line for line in lines if not line.lstrip().startswith("//")]
-    try:
-        pending = json.loads("".join(content_lines))
-    except (json.JSONDecodeError, ValueError):
-        pending = {}
-
-    updated = False
-
-    for key, value in list(pending.items()):
-        if value == "ignore":
-            m = re.match(r"^(.*?)(?: \((\d{4})\))?$", key)
-            title = m.group(1)
-            year = int(m.group(2)) if m.group(2) else None
-            for cache_key, entry in config.cache.items():
-                if entry.get("title") == title and (
-                    entry.get("year") == year or (year is None and not entry.get("year"))
-                ):
-                    config.cache_manager.upsert(
-                        cache_key,
-                        {
-                            "title": title,
-                            "year": year,
-                            "type": entry.get("type"),
-                            "tmdb_id": entry.get("tmdb_id"),
-                            "tvdb_id": entry.get("tvdb_id"),
-                            "imdb_id": entry.get("imdb_id"),
-                            "status": "ignored",
-                            "last_checked": datetime.now().isoformat(),
-                        },
-                    )
-                    break
-            ignored.add(key)
-            del pending[key]
-            continue
-        if value and value != "add_tmdb_url_here":
-            tmdb_id = None
-            if isinstance(value, str):
-                m = re.search(r"(\d+)", value)
-                if m:
-                    tmdb_id = int(m.group(1))
-            if not tmdb_id:
-                del pending[key]
-                continue
-
-            m = re.match(r"^(.*?)(?: \((\d{4})\))?$", key)
-            title = m.group(1)
-            year = int(m.group(2)) if m.group(2) else None
-
-            old_key = None
-            entry = None
-            for cache_key, cache_entry in config.cache.items():
-                if cache_entry.get("title") == title and (
-                    cache_entry.get("year") == year or (year is None and not cache_entry.get("year"))
-                ):
-                    old_key = cache_key
-                    entry = cache_entry
-                    break
-            if not entry:
-                del pending[key]
-                continue
-
-            media_item = MediaItem(
-                config=config,
-                type=entry.get("type", "movie"),
-                title=entry.get("title"),
-                year=entry.get("year"),
-                tmdb_id=tmdb_id,
-                tvdb_id=entry.get("tvdb_id"),
-                imdb_id=entry.get("imdb_id"),
-                files=entry.get("current_filenames", []),
-            )
-            media_item.enrich()
-            new_key = config.cache_manager.get_cache_key(media_item)
-            resolved_title = media_item.new_title or media_item.title
-            resolved_year = media_item.new_year if media_item.new_year is not None else media_item.year
-            resolved_tmdb_id = (
-                media_item.new_tmdb_id if media_item.new_tmdb_id is not None else media_item.tmdb_id
-            )
-            resolved_type = media_item.type
-
-            config.cache_manager.upsert(
-                new_key,
-                {
-                    "title": resolved_title,
-                    "year": resolved_year,
-                    "type": resolved_type,
-                    "tmdb_id": resolved_tmdb_id,
-                    "tvdb_id": media_item.new_tvdb_id or media_item.tvdb_id,
-                    "imdb_id": media_item.new_imdb_id or media_item.imdb_id,
-                    "status": "found",
-                    "last_checked": datetime.now().isoformat(),
-                },
-            )
-            if old_key in config.cache_manager.cache:
-                config.cache_manager.cache.pop(old_key)
-            with sqlite3.connect(config.cache_manager.db_path) as conn:
-                conn.execute("DELETE FROM cache WHERE key = ?", (old_key,))
-                conn.commit()
-
-            updated = True
-            del pending[key]
-
-    header_lines = []
-    if os.path.exists(IGNORED_TITLES_PATH):
-        with open(IGNORED_TITLES_PATH, encoding="utf-8") as f_in:
-            for line in f_in:
-                if line.lstrip().startswith("//"):
-                    header_lines.append(line.rstrip("\n"))
-                else:
-                    break
-    with open(IGNORED_TITLES_PATH, "w", encoding="utf-8") as f_out:
-        for comment in header_lines:
-            f_out.write(comment + "\n")
-        json.dump(sorted(ignored), f_out, indent=2, ensure_ascii=False)
-        f_out.write("\n")
-
-    if updated:
-        config.cache = config.cache_manager.cache
-    save_pending_matches(pending)
-
-
 # --- MediaItem class ---
 class MediaItem:
     """
@@ -2818,85 +2668,280 @@ def export_csvs(
         write_csv(tvdb_missing_path, tvdb_rows, final_tvdb_fieldnames)
 
 
-def load_ignore_and_migrate_pending(config: "IdarrConfig") -> tuple[set[str], dict[str, Any]]:
+def load_ignore_and_sync_pending(config: "IdarrConfig") -> tuple[set[str], dict[str, Any]]:
     """
-    Load the ignore list (preserving comments), migrate any "ignore" entries from pending_matches,
-    save files if changed, and return (ignored_title_keys, updated_pending_matches).
-    Args:
-        config: Configuration object.
-    Returns:
-        Tuple of (ignored_title_keys as a set, updated_pending_matches as dict).
+    Keep ignored_titles.jsonc and pending_matches.jsonc in sync:
+    - If a title is in ignored_titles, remove from pending_matches and mark as ignored in cache.
+    - If a title is removed from ignored_titles, re-populate in pending_matches (unless already matched/found in cache) and un-ignore in cache.
     """
-    ignore_file = getattr(config, "ignore_file", None)
-    if ignore_file is None:
-        ignore_file = os.path.join(LOG_DIR, "ignored_titles.jsonc")
+    ignore_file = getattr(config, "ignore_file", None) or os.path.join(LOG_DIR, "ignored_titles.jsonc")
+    pending_file = PENDING_MATCHES_PATH
+
+    # 1. Load ignore list
     ignored_title_keys = set()
     ignore_file_header_lines = []
-    ignore_data = None
     if os.path.exists(ignore_file):
-        try:
-            with open(ignore_file, "r", encoding="utf-8") as f:
-                lines = []
-                for line in f:
-                    stripped = line.lstrip()
-                    if stripped.startswith("//") or stripped.startswith("#"):
-                        ignore_file_header_lines.append(line)
-                        continue
-                    lines.append(line)
-                ignore_data = json.loads("".join(lines))
-            if isinstance(ignore_data, dict):
-                ignored_title_keys = set(ignore_data.keys())
-            elif isinstance(ignore_data, list):
-                ignored_title_keys = set(ignore_data)
-        except Exception as e:
-            log.warning(f"⚠️ Failed to load ignore file {ignore_file}: {e}")
-    else:
+        with open(ignore_file, "r", encoding="utf-8") as f:
+            lines = []
+            for line in f:
+                stripped = line.lstrip()
+                if stripped.startswith("//") or stripped.startswith("#"):
+                    ignore_file_header_lines.append(line)
+                    continue
+                lines.append(line)
+            try:
+                data = json.loads("".join(lines))
+                if isinstance(data, dict):
+                    ignored_title_keys = set(data.keys())
+                elif isinstance(data, list):
+                    ignored_title_keys = set(data)
+            except Exception as e:
+                log.warning(f"⚠️ Failed to load ignore file {ignore_file}: {e}")
 
-        try:
-            os.makedirs(os.path.dirname(ignore_file), exist_ok=True)
-            with open(ignore_file, "w", encoding="utf-8") as f:
-                f.write(
-                    "// List base filenames (excluding extensions) to ignore during enrichment and pending_matches updates.\n"
-                )
-                f.write("// Example: For 'Some Movie (2023).jpg', use 'Some Movie (2023)'\n")
-                f.write("[\n")
-                f.write('  "Sample Poster (2023)"\n')
-                f.write("]\n")
-                f.write("\n")
-            ignore_file_header_lines = [
-                "// List base filenames (excluding extensions) to ignore during enrichment and pending_matches updates.\n",
-                "// Example: For 'Some Movie (2023).jpg', use 'Some Movie (2023)'\n",
-            ]
-        except Exception as e:
-            log.warning(f"⚠️ Failed to create ignore file template at {ignore_file}: {e}")
-        ignored_title_keys = set()
+    # 2. Load pending matches
+    pending_matches = {}
+    if os.path.exists(pending_file):
+        with open(pending_file, encoding="utf-8") as f:
+            lines = [line for line in f if not line.lstrip().startswith("//")]
+            try:
+                pending_matches = json.loads("".join(lines))
+            except Exception as e:
+                log.warning(f"⚠️ Failed to load pending matches: {e}")
+                pending_matches = {}
 
-    pending_matches = getattr(config, "pending_matches", {}).copy()
-    migrated = False
-    ignore_candidates = [k for k, v in list(pending_matches.items()) if v == "ignore"]
-    for title_key in ignore_candidates:
-        if title_key not in ignored_title_keys:
-            ignored_title_keys.add(title_key)
-            migrated = True
-            log.info(f"🔄 Migrated '{title_key}' from pending_matches to ignore list.")
-        del pending_matches[title_key]
-        migrated = True
-    resolve_pending_matches(config)
-    if migrated:
-        try:
-            with open(ignore_file, "w", encoding="utf-8") as f:
-                if ignore_file_header_lines:
-                    for line in ignore_file_header_lines:
-                        f.write(line)
-                    if not ignore_file_header_lines[-1].endswith("\n"):
-                        f.write("\n")
-                ignore_list_sorted = sorted(ignored_title_keys)
-                json.dump(ignore_list_sorted, f, indent=2, ensure_ascii=False)
-                f.write("\n")
-        except Exception as e:
-            log.warning(f"⚠️ Failed to save updated ignore file {ignore_file}: {e}")
-        save_pending_matches(pending_matches)
+    # 3. Handle ignores -> remove from pending and set ignored in cache
+    for ignored_key in list(ignored_title_keys):
+        # Remove from pending if present
+        if ignored_key in pending_matches:
+            del pending_matches[ignored_key]
+            log.info(f"🔄 Removed '{ignored_key}' from pending_matches due to ignore list.")
+
+        # Set as ignored in cache
+        m = re.match(r"^(.*?)(?: \((\d{4})\))?$", ignored_key)
+        title = m.group(1)
+        year = int(m.group(2)) if m and m.group(2) else None
+        for cache_key, entry in config.cache.items():
+            if entry.get("title") == title and (
+                entry.get("year") == year or (year is None and not entry.get("year"))
+            ):
+                if entry.get("status") != "ignored":
+                    entry["status"] = "ignored"
+                    config.cache_manager.upsert(
+                        cache_key,
+                        {
+                            **entry,
+                            "status": "ignored",
+                            "last_checked": datetime.now().isoformat(),
+                        },
+                    )
+
+    # 4. Handle removed from ignore list: should be re-added to pending if not found in cache
+    # (We compare cache for ignored items that are no longer ignored, and revert their status, add to pending)
+    previously_ignored = set()
+    if os.path.exists(config.cache_manager.db_path):
+        for cache_key, entry in config.cache.items():
+            if entry.get("status") == "ignored":
+                label = entry.get("title")
+                year = entry.get("year")
+                if year:
+                    key = f"{label} ({year})"
+                else:
+                    key = f"{label}"
+                previously_ignored.add(key)
+
+    for was_ignored in previously_ignored:
+        if was_ignored not in ignored_title_keys:
+            # Remove "ignored" status from cache
+            m = re.match(r"^(.*?)(?: \((\d{4})\))?$", was_ignored)
+            title = m.group(1)
+            year = int(m.group(2)) if m and m.group(2) else None
+            for cache_key, entry in config.cache.items():
+                if entry.get("title") == title and (
+                    entry.get("year") == year or (year is None and not entry.get("year"))
+                ):
+                    # If item is not "found" or "matched" (i.e., not resolved), put back to pending
+                    if entry.get("status") == "ignored":
+                        entry["status"] = "unknown"
+                        config.cache_manager.upsert(
+                            cache_key,
+                            {
+                                **entry,
+                                "status": "unknown",
+                                "last_checked": datetime.now().isoformat(),
+                            },
+                        )
+                    # Add to pending_matches if not already matched/found
+                    if was_ignored not in pending_matches:
+                        pending_matches[was_ignored] = "add_tmdb_url_here"
+                        log.info(
+                            f"🔄 Restored '{was_ignored}' to pending_matches (removed from ignore list)."
+                        )
+
+    # 5. Write updated pending matches back
+    try:
+        with open(pending_file, "w", encoding="utf-8") as f:
+            f.write('// List of pending matches in the form "Title (Year)": "add_tmdb_url_here",\n')
+            f.write(
+                '// Replace "add_tmdb_url_here" with a TMDB URL, ID, or use "ignore" to send to ignored_titles.jsonc.\n'
+            )
+            f.write("// Example:\n")
+            f.write('// "Some Movie (2023)": "https://www.themoviedb.org/movie/12345"\n')
+            json.dump(pending_matches, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+    except Exception as e:
+        log.warning(f"⚠️ Failed to save updated pending matches: {e}")
+
     return ignored_title_keys, pending_matches
+
+
+def resolve_pending_matches(config):
+    """
+    Resolve pending matches by updating cache with user-supplied TMDB URLs/IDs.
+    - Updates cache, moves entries, enriches as needed.
+    - Handles ignored and deleted entries.
+    Side effects:
+        Modifies cache, writes to IGNORE and PENDING files, updates SQLite.
+    """
+    ignored = set()
+    existing = []
+    if os.path.exists(IGNORED_TITLES_PATH):
+
+        with open(IGNORED_TITLES_PATH, encoding="utf-8") as f:
+            lines = f.readlines()
+        content_lines = [line for line in lines if not line.lstrip().startswith("//")]
+        try:
+            data = json.loads("".join(content_lines))
+            if isinstance(data, list):
+                existing = data
+                ignored.update(existing)
+        except (json.JSONDecodeError, ValueError):
+            existing = []
+    config.ignored_title_keys = set(existing)
+
+    if not os.path.exists(PENDING_MATCHES_PATH):
+        return
+
+    with open(PENDING_MATCHES_PATH, encoding="utf-8") as f:
+        lines = f.readlines()
+    content_lines = [line for line in lines if not line.lstrip().startswith("//")]
+    try:
+        pending = json.loads("".join(content_lines))
+    except (json.JSONDecodeError, ValueError):
+        pending = {}
+
+    updated = False
+
+    for key, value in list(pending.items()):
+        if value == "ignore":
+            m = re.match(r"^(.*?)(?: \((\d{4})\))?$", key)
+            title = m.group(1)
+            year = int(m.group(2)) if m.group(2) else None
+            for cache_key, entry in config.cache.items():
+                if entry.get("title") == title and (
+                    entry.get("year") == year or (year is None and not entry.get("year"))
+                ):
+                    config.cache_manager.upsert(
+                        cache_key,
+                        {
+                            "title": title,
+                            "year": year,
+                            "type": entry.get("type"),
+                            "tmdb_id": entry.get("tmdb_id"),
+                            "tvdb_id": entry.get("tvdb_id"),
+                            "imdb_id": entry.get("imdb_id"),
+                            "status": "ignored",
+                            "last_checked": datetime.now().isoformat(),
+                        },
+                    )
+                    break
+            ignored.add(key)
+            del pending[key]
+            continue
+        if value and value != "add_tmdb_url_here":
+            tmdb_id = None
+            if isinstance(value, str):
+                m = re.search(r"(\d+)", value)
+                if m:
+                    tmdb_id = int(m.group(1))
+            if not tmdb_id:
+                del pending[key]
+                continue
+
+            m = re.match(r"^(.*?)(?: \((\d{4})\))?$", key)
+            title = m.group(1)
+            year = int(m.group(2)) if m.group(2) else None
+
+            old_key = None
+            entry = None
+            for cache_key, cache_entry in config.cache.items():
+                if cache_entry.get("title") == title and (
+                    cache_entry.get("year") == year or (year is None and not cache_entry.get("year"))
+                ):
+                    old_key = cache_key
+                    entry = cache_entry
+                    break
+            if not entry:
+                del pending[key]
+                continue
+
+            media_item = MediaItem(
+                config=config,
+                type=entry.get("type", "movie"),
+                title=entry.get("title"),
+                year=entry.get("year"),
+                tmdb_id=tmdb_id,
+                tvdb_id=entry.get("tvdb_id"),
+                imdb_id=entry.get("imdb_id"),
+                files=entry.get("current_filenames", []),
+            )
+            media_item.enrich()
+            new_key = config.cache_manager.get_cache_key(media_item)
+            resolved_title = media_item.new_title or media_item.title
+            resolved_year = media_item.new_year if media_item.new_year is not None else media_item.year
+            resolved_tmdb_id = (
+                media_item.new_tmdb_id if media_item.new_tmdb_id is not None else media_item.tmdb_id
+            )
+            resolved_type = media_item.type
+
+            config.cache_manager.upsert(
+                new_key,
+                {
+                    "title": resolved_title,
+                    "year": resolved_year,
+                    "type": resolved_type,
+                    "tmdb_id": resolved_tmdb_id,
+                    "tvdb_id": media_item.new_tvdb_id or media_item.tvdb_id,
+                    "imdb_id": media_item.new_imdb_id or media_item.imdb_id,
+                    "status": "found",
+                    "last_checked": datetime.now().isoformat(),
+                },
+            )
+            if old_key in config.cache_manager.cache:
+                config.cache_manager.cache.pop(old_key)
+            with sqlite3.connect(config.cache_manager.db_path) as conn:
+                conn.execute("DELETE FROM cache WHERE key = ?", (old_key,))
+                conn.commit()
+
+            updated = True
+            del pending[key]
+
+    header_lines = []
+    if os.path.exists(IGNORED_TITLES_PATH):
+        with open(IGNORED_TITLES_PATH, encoding="utf-8") as f_in:
+            for line in f_in:
+                if line.lstrip().startswith("//"):
+                    header_lines.append(line.rstrip("\n"))
+                else:
+                    break
+    with open(IGNORED_TITLES_PATH, "w", encoding="utf-8") as f_out:
+        for comment in header_lines:
+            f_out.write(comment + "\n")
+        json.dump(sorted(ignored), f_out, indent=2, ensure_ascii=False)
+        f_out.write("\n")
+
+    if updated:
+        config.cache = config.cache_manager.cache
+    save_pending_matches(pending)
 
 
 def summarize_run(
@@ -3016,11 +3061,12 @@ def main():
             log.error("❌ --filter requires at least one of --type, --year, or --contains")
             exit(1)
     config = load_runtime_config(args)
-    ignored_title_keys, pending_matches = load_ignore_and_migrate_pending(config)
+    ignored_title_keys, pending_matches = load_ignore_and_sync_pending(config)
     config.pending_matches = pending_matches
     config.ignored_title_keys = ignored_title_keys
 
     handle_special_arguments(args, config, ignored_title_keys)
+    resolve_pending_matches(config)
 
     if config.log_level == "DEBUG":
         print_settings(config)
