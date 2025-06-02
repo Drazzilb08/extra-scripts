@@ -231,9 +231,6 @@ class LogManager:
         self.logger.error(msg)
 
 
-log = LogManager(__name__, LOG_PATH)
-
-
 # --- sleep_and_notify decorator ---
 def sleep_and_notify(func: Callable[..., Any]) -> Callable[..., Any]:
     """
@@ -2246,7 +2243,6 @@ def prune_orphaned_cache_entries(config: IdarrConfig) -> None:
         currents = set(entry.get("current_filenames", []))
         relevant = originals | currents
         if not (relevant & current_files):
-            log.info(f"🗑️ Pruning orphaned cache entry: {entry.get('title')} ({entry.get('year')}) [{key}]")
             with sqlite3.connect(config.cache_manager.db_path) as conn:
                 conn.execute("DELETE FROM cache WHERE key = ?", (key,))
                 conn.commit()
@@ -2289,8 +2285,8 @@ def print_rich_help() -> None:
 
     # --- General Options ---
     table.add_row("[bold]General Options[/bold]", "", "")
-    table.add_row("--source DIR", "Directory of input image files", "Required")
-    table.add_row("--tmdb-api-key KEY", "TMDB API key override", "Required")
+    table.add_row("--source DIR", "Directory of input image files", "Required/.env file")
+    table.add_row("--tmdb-api-key KEY", "TMDB API key override", "Required/.env file")
     table.add_row("--dry-run", "Simulate changes (no actual file ops)", "False")
     table.add_row("--quiet", "Suppress output except progress bars", "False")
     table.add_row("--debug", "Enable debug logging", "False")
@@ -2309,7 +2305,7 @@ def print_rich_help() -> None:
     table.add_row("--no-cache", "Skip loading/saving cache", "False")
     table.add_row("--prune", "Prune orphaned cache entries", "False")
     table.add_row("--purge", 'Delete cache by TMDB ID, "Title (Year)", or "Title"', "")
-    table.add_row("--cache-path PATH", "Custom cache file path", "cache/idarr_cache.json")
+    table.add_row("--cache-path PATH", "Custom cache file path", "cache/idarr_cache.db")
     table.add_section()
 
     # --- Filtering Options ---
@@ -3351,7 +3347,9 @@ def handle_special_arguments(args, config, ignored_title_keys):
 
 
 def main():
+    global log
     args = parse_args()
+    log = LogManager(__name__, LOG_PATH)
     log.info(
         f"************************* IDARR Version: {FULL_VERSION} *************************",
         color="",
