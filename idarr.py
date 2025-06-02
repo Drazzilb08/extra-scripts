@@ -1245,6 +1245,7 @@ class IdarrConfig:
         source_dir: Directory to scan.
         tmdb_api_key: TMDB API key.
         frequency_days: Cache expiration (days).
+        tvdb_frequency: Days before retry TVDb.
         cache_path: Path to cache file.
         no_cache: If True, disables cache.
         clear_cache: If True, clears cache at start.
@@ -1273,7 +1274,7 @@ class IdarrConfig:
     source_dir: Optional[str] = None
     tmdb_api_key: Optional[str] = None
     frequency_days: int = field(default_factory=lambda: int(os.environ.get("FREQUENCY_DAYS", "30")))
-    tvdb_frequency: int = field(default_factory=lambda: int(os.environ.get("TVDB_FREQUENCY", "30")))
+    tvdb_frequency: int = field(default_factory=lambda: int(os.environ.get("TVDB_FREQUENCY", "7")))
     cache_path: str = field(default_factory=lambda: os.path.join(SCRIPT_DIR, "cache", "idarr_cache.json"))
     no_cache: bool = False
     clear_cache: bool = False
@@ -1288,7 +1289,7 @@ class IdarrConfig:
     revert: bool = False
     skip_collections: bool = False
     ignore_file: Optional[str] = None
-    pending_matches: dict[str, Optional[int]] = field(default_factory=dict)
+    pending_matches: dict[str, str] = field(default_factory=dict)
     ignored_title_keys: set[str] = field(default_factory=set)
     cache_manager: "SQLiteCacheManager" = field(init=False)
     cache: dict[str, Any] = field(init=False)
@@ -2277,6 +2278,7 @@ def prune_orphaned_cache_entries(config: IdarrConfig) -> None:
     log.info(
         f"✅ Prune operation complete. {len(removed_keys)} entries removed. {pending_removed} pending matches cleaned up."
     )
+    flush_status()
 
 
 def print_rich_help() -> None:
@@ -2294,8 +2296,9 @@ def print_rich_help() -> None:
     table.add_row("--debug", "Enable debug logging", "False")
     table.add_row("--limit N", "Maximum items to process", "0 (unlimited)")
     table.add_row("--remove-non-image-files", "Remove non-image files", "False")
-    table.add_row("--ignore-file PATH", "Path to ignored_titles.jsonc", "logs/ignored_titles.jsonc")
     table.add_row("--pending-matches", "Only process pending matches list", "False")
+    table.add_row("--ignore-file PATH", "Path to ignored_titles.jsonc", "logs/ignored_titles.jsonc")
+    table.add_row("--pending-matches-path PATH", "Path to pending_matches.jsonc", "logs/pending_matches.jsonc")
     table.add_section()
 
     # --- Caching Options ---
@@ -2303,10 +2306,10 @@ def print_rich_help() -> None:
     table.add_row("--frequency-days DAYS", "Days before cache considered stale", "30")
     table.add_row("--tvdb-frequency DAYS", "Days before retry for missing TVDb IDs", "7")
     table.add_row("--clear-cache", "Delete cache before running", "False")
-    table.add_row("--cache-path PATH", "Custom cache file path", "cache/idarr_cache.json")
     table.add_row("--no-cache", "Skip loading/saving cache", "False")
     table.add_row("--prune", "Prune orphaned cache entries", "False")
     table.add_row("--purge", 'Delete cache by TMDB ID, "Title (Year)", or "Title"', "")
+    table.add_row("--cache-path PATH", "Custom cache file path", "cache/idarr_cache.json")
     table.add_section()
 
     # --- Filtering Options ---
@@ -2352,6 +2355,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--version", action="version", version=f"idarr.py {FULL_VERSION}")
     parser.add_argument("-h", "--help", action="store_true", help=argparse.SUPPRESS)
 
+    # --- General Options ---
     general = parser.add_argument_group("General Options")
     general.add_argument(
         "--source",
@@ -2389,7 +2393,7 @@ def parse_args() -> argparse.Namespace:
         "--limit",
         metavar="N",
         type=int,
-        default=int(os.environ.get("LIMIT", 0)) if os.environ.get("LIMIT") else None,
+        default=int(os.environ.get("LIMIT")) if os.environ.get("LIMIT") else None,
         help=argparse.SUPPRESS,
     )
     general.add_argument(
@@ -2406,6 +2410,12 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     general.add_argument(
+        "--pending-matches",
+        action="store_true",
+        default=env_bool("PENDING_MATCHES", False),
+        help="Only process and resolve pending matches (including renaming just-resolved entries).",
+    )
+    general.add_argument(
         "--pending-matches-path",
         metavar="PATH",
         type=str,
@@ -2413,6 +2423,7 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
 
+    # --- Caching Options ---
     cache = parser.add_argument_group("Caching Options")
     cache.add_argument(
         "--frequency-days",
@@ -2456,9 +2467,53 @@ def parse_args() -> argparse.Namespace:
     cache.add_argument(
         "--purge",
         type=str,
+        default=os.environ.get("PURGE"),
         help='Delete cache entries by TMDB ID or by "Title (Year)" or "Title"',
     )
 
+    # --- Filtering Options ---
+    filtering = parser.add_argument_group("Filtering Options")
+    filtering.add_argument(
+        "--filter",
+        action="store_true",
+        default=env_bool("FILTER", False),
+        help=argparse.SUPPRESS,
+    )
+    filtering.add_argument(
+        "--type",
+        choices=["movie", "tv_series", "collection"],
+        default=os.environ.get("TYPE"),
+        help=argparse.SUPPRESS,
+    )
+    filtering.add_argument(
+        "--year",
+        metavar="YEAR",
+        type=int,
+        default=int(os.environ.get("YEAR")) if os.environ.get("YEAR") else None,
+        help=argparse.SUPPRESS,
+    )
+    filtering.add_argument(
+        "--contains",
+        metavar="TEXT",
+        type=str,
+        default=os.environ.get("CONTAINS"),
+        help=argparse.SUPPRESS,
+    )
+    filtering.add_argument(
+        "--id",
+        metavar="ID",
+        type=str,
+        default=os.environ.get("ID"),
+        help=argparse.SUPPRESS,
+    )
+    filtering.add_argument(
+        "--skip-collections",
+        action="store_true",
+        default=env_bool("SKIP_COLLECTIONS", False),
+        help=argparse.SUPPRESS,
+    )
+
+    # --- Export & Recovery ---
     extra = parser.add_argument_group("Export & Recovery")
     extra.add_argument(
         "--show-unmatched",
