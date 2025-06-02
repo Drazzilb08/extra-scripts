@@ -3318,7 +3318,9 @@ def main():
         print_settings(config)
     start_time = time.time()
     items = scan_files_in_flat_folder(config)
-    config.tmdb_query_service.rehydrate_missing_tvdb_ids(config.cache, max_age_days=config.tvdb_frequency)
+    if any(entry.get("type") == "tv_series" and not entry.get("tvdb_id") for entry in config.cache.values()):
+        config.tmdb_query_service.rehydrate_missing_tvdb_ids(config.cache, max_age_days=config.tvdb_frequency)
+        prune_orphaned_cache_entries(config)
     items = filter_items(args, items)
     if not items:
         log.info("No items found to process. Exiting.")
