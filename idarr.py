@@ -2718,7 +2718,7 @@ def perform_revert(config: "IdarrConfig", items: list["MediaItem"]) -> bool:
 
 
 def filter_items(args: argparse.Namespace, items: list["MediaItem"]) -> list["MediaItem"]:
-    if args.filter:
+    if getattr(args, "filter", False):
         if args.type:
             items = [i for i in items if i.type == args.type]
         if args.year:
