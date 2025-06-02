@@ -2283,51 +2283,52 @@ def print_rich_help() -> None:
     table = Table(show_header=True, header_style="bold purple")
     table.add_column("Option", style="green", no_wrap=True)
     table.add_column("Description", style="white")
+    table.add_column("Default Value", style="yellow")
 
-    # General Options
-    table.add_row("[bold]General Options[/bold]", "")
-    table.add_row("--source DIR", "Directory of input image files")
-    table.add_row("--tmdb-api-key KEY", "Override the TMDB API key")
-    table.add_row("--dry-run", "Simulate renaming operations without making changes")
-    table.add_row("--quiet", "Suppress all output except progress bars")
-    table.add_row("--debug", "Enable debug logging output")
-    table.add_row("--limit N", "Maximum number of items to process")
-    table.add_row("--remove-non-image-files", "Remove non-image files (default: ignore them)")
-    table.add_row("--ignore-file PATH", "Path to ignored_titles.jsonc file")
-    table.add_row("--pending-matches", "Only process pending matches list")
+    # --- General Options ---
+    table.add_row("[bold]General Options[/bold]", "", "")
+    table.add_row("--source DIR", "Directory of input image files", "Required")
+    table.add_row("--tmdb-api-key KEY", "TMDB API key override", "Required")
+    table.add_row("--dry-run", "Simulate changes (no actual file ops)", "False")
+    table.add_row("--quiet", "Suppress output except progress bars", "False")
+    table.add_row("--debug", "Enable debug logging", "False")
+    table.add_row("--limit N", "Maximum items to process", "0 (unlimited)")
+    table.add_row("--remove-non-image-files", "Remove non-image files", "False")
+    table.add_row("--ignore-file PATH", "Path to ignored_titles.jsonc", "logs/ignored_titles.jsonc")
+    table.add_row("--pending-matches", "Only process pending matches list", "False")
     table.add_section()
 
-    # Caching Options
-    table.add_row("[bold]Caching Options[/bold]", "")
-    table.add_row("--frequency-days DAYS", "Days before cache entries are considered stale")
-    table.add_row("--tvdb-frequency DAYS", "Days before re-searching for items w/o TVDb IDs")
-    table.add_row("--clear-cache", "Delete the existing metadata cache before running")
-    table.add_row("--cache-path PATH", "Specify a custom cache file path")
-    table.add_row("--no-cache", "Skip loading or saving the cache")
-    table.add_row("--prune", "Prune cache entries that are no longer associated with a file")
-    table.add_row("--purge", 'Delete cache entries by TMDB ID or by "Title (Year)" or "Title"')
+    # --- Caching Options ---
+    table.add_row("[bold]Caching Options[/bold]", "", "")
+    table.add_row("--frequency-days DAYS", "Days before cache considered stale", "30")
+    table.add_row("--tvdb-frequency DAYS", "Days before retry for missing TVDb IDs", "7")
+    table.add_row("--clear-cache", "Delete cache before running", "False")
+    table.add_row("--cache-path PATH", "Custom cache file path", "cache/idarr_cache.json")
+    table.add_row("--no-cache", "Skip loading/saving cache", "False")
+    table.add_row("--prune", "Prune orphaned cache entries", "False")
+    table.add_row("--purge", 'Delete cache by TMDB ID, "Title (Year)", or "Title"', "")
     table.add_section()
 
-    # Filtering Options
-    table.add_row("[bold]Filtering Options[/bold]", "")
-    table.add_row("--filter", "Enable filtering mode (requires one or more of --type, --year, or --contains)")
-    table.add_row("--type {movie,tv_series,collection}", "Only process a specific media type")
-    table.add_row("--year YEAR", "Only process items released in a specific year")
-    table.add_row("--contains TEXT", "Only include titles containing this substring (case-insensitive)")
-    table.add_row("--id ID", "Only include items with a specific ID (tmdb-123, tvdb-456, imdb-tt1234567)")
-    table.add_row("--skip-collections", "Skip enriching items identified as collections")
+    # --- Filtering Options ---
+    table.add_row("[bold]Filtering Options[/bold]", "", "")
+    table.add_row("--filter", "Enable filtering mode", "")
+    table.add_row("--type {movie,tv_series,collection}", "Only process a specific media type", "")
+    table.add_row("--year YEAR", "Only process items from this year", "")
+    table.add_row("--contains TEXT", "Only include titles containing text", "")
+    table.add_row("--id ID", "Only items with a specific TMDB/TVDB/IMDB ID", "")
+    table.add_row("--skip-collections", "Skip collection enrichment", "False")
     table.add_section()
 
-    # Export & Recovery
-    table.add_row("[bold]Export & Recovery[/bold]", "")
-    table.add_row("--show-unmatched", "Print unmatched items even in quiet mode")
-    table.add_row("--revert", "Undo renames using the cache file for history")
+    # --- Export & Recovery ---
+    table.add_row("[bold]Export & Recovery[/bold]", "", "")
+    table.add_row("--show-unmatched", "Show unmatched items", "False")
+    table.add_row("--revert", "Undo file renames using cache", "False")
     table.add_section()
 
-    # Other
-    table.add_row("[bold]Other[/bold]", "")
-    table.add_row("-h, --help", "Show this help message and exit")
-    table.add_row("--version", "Show program's version number and exit")
+    # --- Other ---
+    table.add_row("[bold]Other[/bold]", "", "")
+    table.add_row("-h, --help", "Show this help message and exit", "")
+    table.add_row("--version", "Show program's version and exit", "")
 
     console.print("[bold cyan]IDARR: Poster Asset Renamer & ID Tagger[/bold cyan]")
     console.print(table)
