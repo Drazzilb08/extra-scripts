@@ -900,10 +900,10 @@ class TMDBQueryService:
                             updated += 1
                     except Exception as e:
                         log.warning(f"Failed to rehydrate {entry.get('title')} [{tmdb_id}]: {e}")
-        if updated == 0:
-            log.info("✅ No stale TV series missing tvdb_id needed rehydration.")
-        else:
+        if updated != 0:
             log.info(f"✅ Rehydrated {updated} TV series entries missing tvdb_id (stale only).")
+            return True
+        return False
 
     def _fuzzy_match_candidates(
         self,
@@ -3372,8 +3372,9 @@ def main():
     start_time = time.time()
     items = scan_files_in_flat_folder(config)
     if any(entry.get("type") == "tv_series" and not entry.get("tvdb_id") for entry in config.cache.values()):
-        config.tmdb_query_service.rehydrate_missing_tvdb_ids(config.cache, max_age_days=config.tvdb_frequency)
-        prune_orphaned_cache_entries(config)
+        switch = config.tmdb_query_service.rehydrate_missing_tvdb_ids(config.cache, max_age_days=config.tvdb_frequency)
+        if switch:
+            prune_orphaned_cache_entries(config)
     items = filter_items(args, items)
     if not items:
         log.info("No items found to process. Exiting.")
