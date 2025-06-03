@@ -870,8 +870,8 @@ class TMDBQueryService:
                             [result],
                             search,
                             strict=False,
-                            ratio_threshold=0.5,
-                            jaccard_threshold=0.0,
+                            ratio_threshold=0.80,
+                            jaccard_threshold=0.60,
                             year_tolerance=2,
                         )
                         if candidates:
