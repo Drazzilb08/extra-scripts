@@ -77,6 +77,7 @@ SEASON_PATTERN: Pattern = re.compile(
 TMDB_ID_REGEX: Pattern = re.compile(r"tmdb[-_\s](\d+)")
 TVDB_ID_REGEX: Pattern = re.compile(r"tvdb[-_\s](\d+)")
 IMDB_ID_REGEX: Pattern = re.compile(r"imdb[-_\s](tt\d+)")
+TITLE_YEAR_REGEX: Pattern = re.compile(r"^(.*?)(?: \((\d{4})\))?$")
 UNMATCHED_CASES: list[dict[str, Any]] = []
 TVDB_MISSING_CASES: list[dict[str, Any]] = []
 RECLASSIFIED: list[dict[str, Any]] = []
@@ -520,10 +521,7 @@ class SQLiteCacheManager:
                     found = True
             return found
 
-        # Otherwise, treat as title (with optional year)
-        import re
-
-        m = re.match(r"^(.*?)(?: \((\d{4})\))?$", query.strip())
+        m = re.match(TITLE_YEAR_REGEX, query.strip())
         if m:
             title = m.group(1).strip()
             year = int(m.group(2)) if m.group(2) else None
@@ -643,6 +641,47 @@ class TMDBQueryService:
                     )
                     search.match_reason = reason
                     return result
+
+                # If TMDB ID lookup fails, handle potential TMDB removal for previously matched item
+                if (
+                    not result
+                    and getattr(search, "tmdb_id", None)
+                    and getattr(search, "match_reason", None) != "ambiguous"
+                ):
+                    # Only perform if this item had previously matched and is now missing
+                    log.warning(
+                        f"❌ TMDB entry for '{search.title}' ({search.year}) [tmdb-{search.tmdb_id}] was deleted from TMDB. Marking as tmdb_removed."
+                    )
+                    # Build unmatched-style cache key (normalize as per unmatched)
+                    unmatched_key = self.config.cache_manager.get_cache_key(
+                        type(
+                            "Dummy",
+                            (),
+                            {
+                                "title": search.title,
+                                "year": search.year,
+                                "tmdb_id": None,
+                                "tvdb_id": None,
+                                "imdb_id": None,
+                            },
+                        )()
+                    )
+                    # Remove all tags from all filenames (physical files)
+                    search.current_filenames = strip_tags_and_rename(
+                        search.current_filenames, dry_run=self.config.dry_run, log=log
+                    )
+                    # Update entry: clear IDs, set status
+                    search.tmdb_id = None
+                    search.tvdb_id = None
+                    search.imdb_id = None
+                    search.match_reason = "tmdb_removed"
+                    if hasattr(search, "status"):
+                        search.status = "tmdb_removed"
+                    # Upsert in cache using new unmatched key
+                    self.config.cache_manager.upsert(unmatched_key, search.__dict__)
+                    # Return None as no match was found and we handled cleanup
+                    search.match_failed = True
+                    return None
 
             # === Step 2: Main TMDB Search ===
             if getattr(search, "match_reason", None) == "ambiguous":
@@ -1314,7 +1353,7 @@ def save_pending_matches(pending_matches: dict, pending_file: str = PENDING_MATC
 
 def update_pending_matches_from_cache(config) -> dict[str, str]:
     """
-    Build pending matches from cache: only items with status == 'not_found'.
+    Build pending matches from cache: items with status == 'not_found' or status == 'tmdb_removed'.
     Args:
         config: IdarrConfig or similar with .cache attribute.
     Returns:
@@ -1324,7 +1363,7 @@ def update_pending_matches_from_cache(config) -> dict[str, str]:
     cache = getattr(config, "cache", {})
     for entry in cache.values():
         status = entry.get("status", "not_found")
-        if status != "not_found":
+        if status not in ("not_found", "tmdb_removed"):
             continue
         title = entry.get("title", "")
         year = entry.get("year")
@@ -1615,6 +1654,37 @@ class MediaItem:
             ops.append((old, new))
         return ops
 
+
+def strip_tags_and_rename(filenames, dry_run=False, log=None):
+    """
+    For each file in `filenames`, strip all {tmdb-*}, {tvdb-*}, {imdb-*} tags from the basename.
+    If `dry_run` is False, actually rename the files. Returns the new filenames.
+    Accepts a single filename (str) or a list of filenames.
+    """
+
+    def _strip_all_tags(basename):
+        return re.sub(r"\{(?:tmdb|tvdb|imdb)-[^}]+\}", "", basename).strip()
+
+    if isinstance(filenames, str):
+        filenames = [filenames]
+    updated = []
+    for fname in filenames:
+        dirpath = os.path.dirname(fname)
+        new_basename = _strip_all_tags(os.path.basename(fname))
+        new_path = os.path.join(dirpath, new_basename)
+        if fname != new_path:
+            if os.path.exists(fname) and not dry_run:
+                try:
+                    os.rename(fname, new_path)
+                    log.info(f"Stripped tags: {fname} → {new_path}", "YELLOW")
+                except Exception as e:
+                    log.error(f"Failed to rename {fname}: {e}", "RED")
+            else:
+                log.info(f"Would strip tags: {fname} → {new_path} (dry run)", "YELLOW")
+            updated.append(new_path)
+        else:
+            updated.append(fname)
+    return updated if len(updated) > 1 else updated[0]
 
 def normalize_with_aliases(string: str) -> str:
     """
@@ -2294,7 +2364,9 @@ def print_rich_help() -> None:
     table.add_row("--remove-non-image-files", "Remove non-image files", "False")
     table.add_row("--pending-matches", "Only process pending matches list", "False")
     table.add_row("--ignore-file PATH", "Path to ignored_titles.jsonc", "logs/ignored_titles.jsonc")
-    table.add_row("--pending-matches-path PATH", "Path to pending_matches.jsonc", "logs/pending_matches.jsonc")
+    table.add_row(
+        "--pending-matches-path PATH", "Path to pending_matches.jsonc", "logs/pending_matches.jsonc"
+    )
     table.add_section()
 
     # --- Caching Options ---
@@ -2990,7 +3062,7 @@ def load_ignore_and_sync_pending(config: "IdarrConfig") -> tuple[set[str], dict[
             log.info(f"🔄 Removed '{ignored_key}' from pending_matches due to ignore list.")
 
         # Set as ignored in cache
-        m = re.match(r"^(.*?)(?: \((\d{4})\))?$", ignored_key)
+        m = re.match(TITLE_YEAR_REGEX, ignored_key)
         title = m.group(1)
         year = int(m.group(2)) if m and m.group(2) else None
         for cache_key, entry in config.cache.items():
@@ -3025,7 +3097,7 @@ def load_ignore_and_sync_pending(config: "IdarrConfig") -> tuple[set[str], dict[
     for was_ignored in previously_ignored:
         if was_ignored not in ignored_title_keys:
             # Remove "ignored" status from cache
-            m = re.match(r"^(.*?)(?: \((\d{4})\))?$", was_ignored)
+            m = re.match(TITLE_YEAR_REGEX, was_ignored)
             title = m.group(1)
             year = int(m.group(2)) if m and m.group(2) else None
             for cache_key, entry in config.cache.items():
@@ -3095,7 +3167,7 @@ def resolve_pending_matches(config):
 
     for key, value in list(pending.items()):
         if value == "ignore":
-            m = re.match(r"^(.*?)(?: \((\d{4})\))?$", key)
+            m = re.match(TITLE_YEAR_REGEX, key)
             title = m.group(1)
             year = int(m.group(2)) if m and m.group(2) else None
             for cache_key, entry in config.cache.items():
@@ -3144,7 +3216,7 @@ def resolve_pending_matches(config):
                 del pending[key]
                 continue
 
-            m = re.match(r"^(.*?)(?: \((\d{4})\))?$", key)
+            m = re.match(TITLE_YEAR_REGEX, key)
             title = m.group(1)
             year = int(m.group(2)) if m and m.group(2) else None
 
@@ -3372,7 +3444,9 @@ def main():
     start_time = time.time()
     items = scan_files_in_flat_folder(config)
     if any(entry.get("type") == "tv_series" and not entry.get("tvdb_id") for entry in config.cache.values()):
-        switch = config.tmdb_query_service.rehydrate_missing_tvdb_ids(config.cache, max_age_days=config.tvdb_frequency)
+        switch = config.tmdb_query_service.rehydrate_missing_tvdb_ids(
+            config.cache, max_age_days=config.tvdb_frequency
+        )
         if switch:
             prune_orphaned_cache_entries(config)
     items = filter_items(args, items)
