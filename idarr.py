@@ -1441,6 +1441,11 @@ class MediaItem:
         self.renamed: bool = False
         self.original_title: str = title
         self.original_year: Optional[int] = year
+    
+    def __repr__(self):
+        files = getattr(self, 'files', [])
+        file_list = [os.path.basename(f) for f in files]
+        return f"<MediaItem title={self.title!r}, year={self.year!r}, files={file_list}>"
 
     def _update_and_save_cache(self, key: str, value: dict[str, Any]) -> None:
         """
@@ -1688,35 +1693,50 @@ def strip_tags_and_rename(filenames, dry_run=False, log=None):
 
 def normalize_with_aliases(string: str) -> str:
     """
-    Normalize a string to ASCII, lowercased, with common abbreviations/aliases expanded.
-    Args:
-        string: Input string.
-    Returns:
-        Canonical normalized string.
+    Normalize a string to ASCII, lowercased, with canonical abbreviation/alias mapping.
     """
-    substitutions = [
-        ("&", "and"),
-        ("vs.", "versus"),
-        ("vs", "versus"),
-        ("ep.", "episode"),
-        ("ep", "episode"),
-        ("vol.", "volume"),
-        ("vol", "volume"),
-        ("pt.", "part"),
-        ("pt", "part"),
-        ("dr.", "doctor"),
-        ("dr", "doctor"),
-        ("+", "/"),
-        ("_", ":"),
-    ]
-    nfkd = unicodedata.normalize("NFKD", string)
-    string_ascii = nfkd.encode("ASCII", "ignore").decode()
-    for a, b in substitutions:
-        string_ascii = re.sub(rf"\b{re.escape(a)}\b", b, string_ascii, flags=re.IGNORECASE)
-        string_ascii = re.sub(rf"\b{re.escape(b)}\b", a, string_ascii, flags=re.IGNORECASE)
-    string_ascii = string_ascii.lower()
-    string_ascii = re.sub(r"\s+", " ", string_ascii).strip()
-    return string_ascii
+
+    CANONICAL_ALIASES = {
+        "&": "and",
+        "and": "and",
+        "vs.": "versus",
+        "vs": "versus",
+        "ep.": "episode",
+        "ep": "episode",
+        "vol.": "volume",
+        "vol": "volume",
+        "pt.": "part",
+        "pt": "part",
+        "dr.": "doctor",
+        "dr": "doctor",
+        "doctor": "doctor",
+    }
+
+    def remove_apostrophes(s: str) -> str:
+        return re.sub(r"[’'`ʹʼ]", "", s)
+
+    def to_ascii(s: str) -> str:
+        nfkd = unicodedata.normalize("NFKD", s)
+        return nfkd.encode("ASCII", "ignore").decode()
+
+    def canonicalize_tokens(s: str) -> str:
+        # Tokenize, but preserve non-word separators
+        words = re.split(r"(\W+)", s)
+        normalized = [
+            CANONICAL_ALIASES.get(w.lower(), w.lower()) if w.strip() else w
+            for w in words
+        ]
+        return "".join(normalized)
+
+    def to_lower_strip_spaces(s: str) -> str:
+        return re.sub(r"\s+", " ", s).strip().lower()
+
+    s = string
+    s = remove_apostrophes(s)
+    s = to_ascii(s)
+    s = canonicalize_tokens(s)
+    s = to_lower_strip_spaces(s)
+    return s
 
 
 def parse_file_group(config: "IdarrConfig", base_name: str, files: list[str]) -> MediaItem:
@@ -1907,7 +1927,6 @@ def scan_files_in_flat_folder(config: "IdarrConfig") -> list[MediaItem]:
     log.info(
         f"✅ Completed scanning: discovered {len(assets_dict)} asset groups covering {total_assets} files"
     )
-
     return assets_dict
 
 
