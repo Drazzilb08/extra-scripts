@@ -14,6 +14,7 @@ from difflib import SequenceMatcher
 from types import SimpleNamespace
 from dataclasses import dataclass, field
 from functools import wraps
+from urllib.parse import quote_plus
 import json
 from datetime import datetime, timedelta
 import signal
@@ -230,49 +231,6 @@ class LogManager:
         if console and not self.quiet:
             print(f"{self.COLORS.get(color.upper(), '')}{msg}\033[0m")
         self.logger.error(msg)
-
-
-# --- sleep_and_notify decorator ---
-def sleep_and_notify(func: Callable[..., Any]) -> Callable[..., Any]:
-    """
-    Decorator that catches RateLimitException, sleeps for the required period, and retries.
-    Args:
-        func: Callable to wrap.
-    Returns:
-        Wrapped function, which retries after rate limiting.
-    Side effects:
-        Sleeps when rate limit is hit, logs warnings.
-    """
-
-    @wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        while True:
-            try:
-                return func(*args, **kwargs)
-            except RateLimitException as e:
-                log.warning(
-                    f"\033[93m[WARNING]\033[0m Rate limit hit, sleeping for {e.period_remaining:.2f} seconds"
-                )
-                time.sleep(e.period_remaining)
-
-    return wrapper
-
-
-def normalize_cache_key(title: str) -> str:
-    """
-    Normalize a string for use as a cache key.
-    - Lowercase, collapse spaces, strip whitespace.
-    - Remove most punctuation except Unicode "·".
-    - Replace all other punctuation with spaces.
-    Args:
-        title: Input string.
-    Returns:
-        Normalized string suitable for cache key.
-    """
-    allowed = "·"
-    norm = "".join(c if c.isalnum() or c.isspace() or c in allowed else " " for c in title)
-    norm = re.sub(r"\s+", " ", norm).strip().lower()
-    return norm
 
 
 # --- SQLiteCacheManager class ---
@@ -544,33 +502,30 @@ class SQLiteCacheManager:
                 conn.commit()
 
 
-def ensure_title_year(entry: dict, item: Any = None) -> dict:
+# --- sleep_and_notify decorator ---
+def sleep_and_notify(func: Callable[..., Any]) -> Callable[..., Any]:
     """
-    Ensure the entry dict has title, year, and type fields populated.
-    If missing, fills from item if provided.
+    Decorator that catches RateLimitException, sleeps for the required period, and retries.
     Args:
-        entry: Dict to update.
-        item: Optional MediaItem.
+        func: Callable to wrap.
     Returns:
-        Updated dict with title/year/type.
+        Wrapped function, which retries after rate limiting.
+    Side effects:
+        Sleeps when rate limit is hit, logs warnings.
     """
-    if item is not None:
-        entry["title"] = (
-            getattr(item, "new_title", None) or getattr(item, "title", "") or entry.get("title", "")
-        )
-        entry["year"] = getattr(item, "new_year", None)
-        if entry["year"] is None:
-            entry["year"] = getattr(item, "year", None)
-        if entry["year"] is None:
-            entry["year"] = getattr(item, "original_year", None)
-        if entry["year"] is None:
-            entry["year"] = entry.get("year", None)
-        entry["type"] = getattr(item, "type", None) or entry.get("type", None)
-    else:
-        entry["title"] = entry.get("title", "")
-        entry["year"] = entry.get("year", None)
-        entry["type"] = entry.get("type", None)
-    return entry
+
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        while True:
+            try:
+                return func(*args, **kwargs)
+            except RateLimitException as e:
+                log.warning(
+                    f"\033[93m[WARNING]\033[0m Rate limit hit, sleeping for {e.period_remaining:.2f} seconds"
+                )
+                time.sleep(e.period_remaining)
+
+    return wrapper
 
 
 # --- TMDBQueryService class ---
@@ -1013,6 +968,9 @@ class TMDBQueryService:
             else:
                 if score > 1.0:
                     candidates.append(res)
+        log.debug(
+            f"[DEBUG] Comparing: {norm_search!r} vs {norm_res!r} | Ratio: {ratio:.2f}, Jaccard: {jaccard:.2f}"
+        )
         if strict:
             return candidates[0] if len(candidates) == 1 else None
         else:
@@ -1208,6 +1166,7 @@ class TMDBQueryService:
             (lambda s: s.replace("-", ":"), lambda s: "-" in s),
             (lambda s: s.replace("-", "\\"), lambda s: "-" in s),
             (lambda s: s.replace("+", "\\"), lambda s: "+" in s),
+            (lambda s: s.replace("+", "/"), lambda s: "+" in s),
         ]
         for transform, predicate in transformations:
             if predicate(search.title):
@@ -1333,48 +1292,6 @@ class IdarrConfig:
     _api_calls: int = 0
 
 
-def save_pending_matches(pending_matches: dict, pending_file: str = PENDING_MATCHES_PATH):
-    """
-    Write pending matches dict to pending_matches.jsonc with standard header.
-    """
-    try:
-        with open(pending_file, "w", encoding="utf-8") as f:
-            f.write('// List of pending matches in the form "Title (Year)": "add_tmdb_url_here",\n')
-            f.write(
-                '// Replace "add_tmdb_url_here" with a TMDB URL, ID, or use "ignore" to send to ignored_titles.jsonc.\n'
-            )
-            f.write("// Example:\n")
-            f.write('// "Some Movie (2023)": "https://www.themoviedb.org/movie/12345"\n')
-            json.dump(dict(sorted(pending_matches.items())), f, indent=2, ensure_ascii=False)  # Sort by key
-            f.write("\n")
-    except Exception as e:
-        log.warning(f"⚠️ Failed to save updated pending matches: {e}")
-
-
-def update_pending_matches_from_cache(config) -> dict[str, str]:
-    """
-    Build pending matches from cache: items with status == 'not_found' or status == 'tmdb_removed'.
-    Args:
-        config: IdarrConfig or similar with .cache attribute.
-    Returns:
-        Dict mapping title keys to placeholder string.
-    """
-    pending = {}
-    cache = getattr(config, "cache", {})
-    for entry in cache.values():
-        status = entry.get("status", "not_found")
-        if status not in ("not_found", "tmdb_removed"):
-            continue
-        title = entry.get("title", "")
-        year = entry.get("year")
-        if title and year:
-            key = f"{title} ({year})"
-        else:
-            key = title
-        pending[key] = "add_tmdb_url_here"
-    return pending
-
-
 def is_recent(last_checked: str, config: "IdarrConfig") -> bool:
     """
     Return True if last_checked is within config.frequency_days from now.
@@ -1441,9 +1358,9 @@ class MediaItem:
         self.renamed: bool = False
         self.original_title: str = title
         self.original_year: Optional[int] = year
-    
+
     def __repr__(self):
-        files = getattr(self, 'files', [])
+        files = getattr(self, "files", [])
         file_list = [os.path.basename(f) for f in files]
         return f"<MediaItem title={self.title!r}, year={self.year!r}, files={file_list}>"
 
@@ -1503,7 +1420,7 @@ class MediaItem:
         self.config.cache_manager.verify_and_resolve_collision(key, v)
         self.config.cache = self.config.cache_manager.cache
 
-    def enrich(self) -> bool:
+    def enrich(self, force=False) -> bool:
         """
         Enrich this MediaItem with metadata from TMDB.
         Uses cache if available and recent, otherwise queries TMDB.
@@ -1513,6 +1430,44 @@ class MediaItem:
         Side effects:
             Updates cache, logs actions.
         """
+        if force and self.tmdb_id:
+            # Directly fetch using the current tmdb_id and media type
+            result = self.config.tmdb_query_service._fetch_by_tmdb_id(self, self.type)
+            if not result:
+                log.warning(f"❌ Forced TMDB ID {self.tmdb_id} not found for {self.title} ({self.year})")
+                self.match_failed = True
+                return False
+            # Populate all fields directly, mark as a user match
+            self.new_title = getattr(result, "title", getattr(result, "name", None))
+            tmdb_date = getattr(result, "first_air_date", getattr(result, "release_date", None))
+            if tmdb_date:
+                res_year = tmdb_date.year if hasattr(tmdb_date, "year") else int(str(tmdb_date)[:4])
+                self.new_year = res_year
+            self.new_tmdb_id = result.id
+            self.new_tvdb_id = getattr(result, "tvdb_id", None)
+            self.new_imdb_id = getattr(result, "imdb_id", None)
+            self.type = getattr(result, "media_type", self.type)
+            self.match_reason = "user_tmdb_url"
+            orig_cache_key = self.config.cache_manager.get_cache_key(self)
+            self._update_and_save_cache(
+                orig_cache_key,
+                {
+                    "last_checked": datetime.now().isoformat(),
+                    "type": self.type,
+                    "tmdb_id": self.new_tmdb_id,
+                    "tvdb_id": self.new_tvdb_id,
+                    "imdb_id": self.new_imdb_id,
+                    "year": self.new_year or self.year,
+                    "title": self.new_title or self.title,
+                    "rename_history": [],
+                    "status": "found",
+                },
+            )
+            new_cache_key = self.config.cache_manager.get_cache_key(self)
+            if new_cache_key != orig_cache_key:
+                self.config.cache[new_cache_key] = self.config.cache.pop(orig_cache_key)
+                self._update_and_save_cache(new_cache_key, self.config.cache[new_cache_key])
+            return True
         if not hasattr(self.config, "_api_calls"):
             self.config._api_calls = 0
         orig_cache_key = self.config.cache_manager.get_cache_key(self)
@@ -1660,6 +1615,168 @@ class MediaItem:
         return ops
 
 
+def ensure_title_year(entry: dict, item: Any = None) -> dict:
+    """
+    Ensure the entry dict has title, year, and type fields populated.
+    If missing, fills from item if provided.
+    Args:
+        entry: Dict to update.
+        item: Optional MediaItem.
+    Returns:
+        Updated dict with title/year/type.
+    """
+    if item is not None:
+        entry["title"] = (
+            getattr(item, "new_title", None) or getattr(item, "title", "") or entry.get("title", "")
+        )
+        entry["year"] = getattr(item, "new_year", None)
+        if entry["year"] is None:
+            entry["year"] = getattr(item, "year", None)
+        if entry["year"] is None:
+            entry["year"] = getattr(item, "original_year", None)
+        if entry["year"] is None:
+            entry["year"] = entry.get("year", None)
+        entry["type"] = getattr(item, "type", None) or entry.get("type", None)
+    else:
+        entry["title"] = entry.get("title", "")
+        entry["year"] = entry.get("year", None)
+        entry["type"] = entry.get("type", None)
+    return entry
+
+
+def normalize_cache_key(title: str) -> str:
+    """
+    Normalize a string for use as a cache key.
+    - Lowercase, collapse spaces, strip whitespace.
+    - Remove most punctuation except Unicode "·".
+    - Replace all other punctuation with spaces.
+    Args:
+        title: Input string.
+    Returns:
+        Normalized string suitable for cache key.
+    """
+    allowed = "·"
+    norm = "".join(c if c.isalnum() or c.isspace() or c in allowed else " " for c in title)
+    norm = re.sub(r"\s+", " ", norm).strip().lower()
+    return norm
+
+
+def save_pending_matches(pending_matches: dict, pending_file: str = PENDING_MATCHES_PATH):
+    """
+    Write pending matches dict to pending_matches.jsonc with standard header.
+    Only overwrites if there are unresolved matches.
+    """
+    if not pending_matches:
+        return
+    try:
+        with open(pending_file, "w", encoding="utf-8") as f:
+            f.write('// List of pending matches in the form "Title (Year)": "add_tmdb_url_here",\n')
+            f.write(
+                '// Replace "add_tmdb_url_here" with a TMDB URL, ID, or use "ignore" to send to ignored_titles.jsonc.\n'
+            )
+            f.write("// Example:\n")
+            f.write('// "Some Movie (2023)": "https://www.themoviedb.org/movie/12345"\n')
+            text = json.dumps(dict(sorted(pending_matches.items())), indent=2, ensure_ascii=False)
+            f.write(text + "\n")
+    except Exception as e:
+        log.warning(f"⚠️ Failed to save updated pending matches: {e}")
+
+
+def make_pending_entry(title, year=None, files=None):
+    """
+    Construct a pending match entry (for both ambiguous and not-found cases).
+    - Includes a Google search limited to themoviedb.org.
+    - Includes the best guess at a local file path.
+    """
+    # Format search query
+    query = f"{title} {year}" if year else title
+    google_url = f"https://www.google.com/search?q={quote_plus(query + ' site:themoviedb.org')}"
+    # File logic (absolute path, first file if list)
+    file_str = ""
+    if isinstance(files, list) and files:
+        file_str = os.path.abspath(files[0])
+    elif isinstance(files, str) and files:
+        file_str = os.path.abspath(files)
+    else:
+        file_str = ""
+    return {
+        "add_tmdb_url_here": "add_tmdb_url_here",
+        "google_search": google_url,
+        "files": file_str,
+    }
+
+def update_pending_matches_from_cache(config) -> dict[str, str]:
+    """
+    Update pending matches dict:
+    - If user has filled in a TMDB URL (string or dict), preserve it.
+    - For all other unresolved keys, use a standard pending entry with make_pending_entry.
+    """
+    pending_file = getattr(config, "pending_matches_path", None) or PENDING_MATCHES_PATH
+    prev_pending = {}
+    if os.path.exists(pending_file):
+        try:
+            with open(pending_file, encoding="utf-8") as f:
+                lines = [line for line in f if not line.lstrip().startswith("//")]
+                file_content = "".join(lines)
+                prev_pending = json.loads(file_content)
+        except Exception:
+            prev_pending = {}
+
+    cache = getattr(config, "cache", {})
+    pending = {}
+
+    # Collect unresolved (not_found or tmdb_removed) keys from cache
+    unresolved_keys = set()
+    for entry in cache.values():
+        status = entry.get("status", "not_found")
+        if status in ("not_found", "tmdb_removed"):
+            title = entry.get("title", "")
+            year = entry.get("year")
+            key = f"{title} ({year})" if title and year else title
+            unresolved_keys.add(key)
+
+    for key in unresolved_keys:
+        existing_entry = prev_pending.get(key)
+
+        # If previous entry exists and user has filled in a TMDB URL, preserve it
+        #   - Either as a string (TMDB URL) or dict with non-empty "add_tmdb_url_here"
+        if existing_entry:
+            if isinstance(existing_entry, str):
+                if existing_entry.strip().startswith("http"):
+                    pending[key] = existing_entry
+                    continue
+            elif isinstance(existing_entry, dict):
+                url = existing_entry.get("add_tmdb_url_here", "")
+                if isinstance(url, str) and url.strip().startswith("http"):
+                    pending[key] = existing_entry
+                    continue
+                # Also preserve dict if user is mid-entry (e.g. custom info)
+                pending[key] = existing_entry
+                continue
+
+        # Default: use the unified make_pending_entry
+        title, year = key, None
+        m = re.match(TITLE_YEAR_REGEX, key)
+        if m:
+            title = m.group(1)
+            year = int(m.group(2)) if m.group(2) else None
+        files = ""
+        entry = None
+        for e in cache.values():
+            t = e.get("title", "")
+            y = e.get("year", None)
+            k = f"{t} ({y})" if t and y else t
+            if k == key:
+                entry = e
+                break
+        if isinstance(entry, dict):
+            fns = entry.get("current_filenames", [])
+            files = fns[0] if isinstance(fns, list) and fns else ""
+        pending[key] = make_pending_entry(title, year, files)
+
+    return pending
+
+
 def strip_tags_and_rename(filenames, dry_run=False, log=None):
     """
     For each file in `filenames`, strip all {tmdb-*}, {tvdb-*}, {imdb-*} tags from the basename.
@@ -1691,6 +1808,7 @@ def strip_tags_and_rename(filenames, dry_run=False, log=None):
             updated.append(fname)
     return updated if len(updated) > 1 else updated[0]
 
+
 def normalize_with_aliases(string: str) -> str:
     """
     Normalize a string to ASCII, lowercased, with canonical abbreviation/alias mapping.
@@ -1720,12 +1838,8 @@ def normalize_with_aliases(string: str) -> str:
         return nfkd.encode("ASCII", "ignore").decode()
 
     def canonicalize_tokens(s: str) -> str:
-        # Tokenize, but preserve non-word separators
         words = re.split(r"(\W+)", s)
-        normalized = [
-            CANONICAL_ALIASES.get(w.lower(), w.lower()) if w.strip() else w
-            for w in words
-        ]
+        normalized = [CANONICAL_ALIASES.get(w.lower(), w.lower()) if w.strip() else w for w in words]
         return "".join(normalized)
 
     def to_lower_strip_spaces(s: str) -> str:
@@ -1971,7 +2085,6 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
                 continue
 
             enriched = item.enrich()
-            cache_key = config.cache_manager.get_cache_key(item)
 
             if not enriched:
                 item.match_failed = True
@@ -1987,11 +2100,20 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
                         "match_reason": getattr(item, "match_reason", ""),
                     }
                 )
-                log.debug(f"Upsert NOT_FOUND: {item.title} ({item.year})")
-                config.cache_manager.upsert(cache_key, {"status": "not_found"}, item)
-                keys_to_upsert.append(cache_key)
-                if raw_title_key not in pending_matches:
-                    pending_matches[raw_title_key] = "add_tmdb_url_here"
+                existing = config.cache.get(cache_key)
+                if existing and existing.get("status") == "ignored":
+                    log.debug(f"NOT upserting NOT_FOUND (already IGNORED): {item.title} ({item.year})")
+                    if raw_title_key in pending_matches:
+                        del pending_matches[raw_title_key]
+                else:
+                    log.debug(f"Upsert NOT_FOUND: {item.title} ({item.year})")
+                    config.cache_manager.upsert(cache_key, {"status": "not_found"}, item)
+                    keys_to_upsert.append(cache_key)
+                    # Always create a pending entry using the unified logic (no candidates)
+                    if raw_title_key not in pending_matches:
+                        pending_matches[raw_title_key] = make_pending_entry(
+                            item.title, item.year, item.files
+                        )
                 if idx % 10 == 0 or idx == total_items:
                     status.update(f"[green]Processing {idx}/{total_items} items...")
                 continue
@@ -2024,6 +2146,7 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
             if idx % 1 == 0 or idx == total_items:
                 status.update(f"[green]Processing {idx}/{total_items} items...")
 
+            # Remove from pending if newly resolved
             if enriched and raw_title_key in pending_matches:
                 del pending_matches[raw_title_key]
             if item.type == "tv_series":
@@ -2039,9 +2162,8 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
                         }
                     )
 
-    new_pending = update_pending_matches_from_cache(config)
-    save_pending_matches(new_pending)
-    config.pending_matches = new_pending
+    config.pending_matches = pending_matches
+    save_pending_matches(config.pending_matches)
 
     if config.show_unmatched and UNMATCHED_CASES:
         for case in UNMATCHED_CASES:
@@ -2256,14 +2378,7 @@ def rename_files(
                             origs.add(old_filename)
                             cache_entry["original_filenames"] = sorted(origs)
 
-                            real_files = (
-                                set(os.listdir(config.source_dir))
-                                if os.path.isdir(config.source_dir)
-                                else set()
-                            )
-                            possibles = set(cache_entry["original_filenames"]) | {h["to"] for h in hist}
-                            cache_entry["current_filenames"] = sorted(f for f in possibles if f in real_files)
-
+                            # Note: current_filenames will be fully synced at the end of this function.
                             config.cache[cache_key] = cache_entry
                         except Exception as e:
                             log.error(f"file_path: {file_path}")
@@ -2276,6 +2391,23 @@ def rename_files(
                 for old_filename, new_filename in item_renames:
                     log.info(f"        - {old_filename}", "RED")
                     log.info(f"        + {new_filename}", "GREEN")
+
+    real_files = set(os.listdir(config.source_dir)) if os.path.isdir(config.source_dir) else set()
+    for media_item in items:
+        cache_key = config.cache_manager.get_cache_key(media_item)
+        cache_entry = config.cache.get(cache_key)
+        if not cache_entry:
+            continue
+        tracked = (
+            set(cache_entry.get("current_filenames", []))
+            | set(cache_entry.get("original_filenames", []))
+            | {h["to"] for h in cache_entry.get("rename_history", [])}
+        )
+        # Only keep filenames that exist
+        updated = sorted(f for f in tracked if f in real_files)
+        if updated != cache_entry.get("current_filenames", []):
+            cache_entry["current_filenames"] = updated
+            config.cache[cache_key] = cache_entry
 
     return file_updates, duplicate_log
 
@@ -2364,449 +2496,6 @@ def prune_orphaned_cache_entries(config: IdarrConfig) -> None:
         f"✅ Prune operation complete. {len(removed_keys)} entries removed. {pending_removed} pending matches cleaned up."
     )
     flush_status()
-
-
-def print_rich_help() -> None:
-    table = Table(show_header=True, header_style="bold purple")
-    table.add_column("Option", style="green", no_wrap=True)
-    table.add_column("Description", style="white")
-    table.add_column("Default Value", style="yellow")
-
-    # --- General Options ---
-    table.add_row("[bold]General Options[/bold]", "", "")
-    table.add_row("--source DIR", "Directory of input image files", "Required/.env file")
-    table.add_row("--tmdb-api-key KEY", "TMDB API key override", "Required/.env file")
-    table.add_row("--dry-run", "Simulate changes (no actual file ops)", "False")
-    table.add_row("--quiet", "Suppress output except progress bars", "False")
-    table.add_row("--debug", "Enable debug logging", "False")
-    table.add_row("--limit N", "Maximum items to process", "0 (unlimited)")
-    table.add_row("--remove-non-image-files", "Remove non-image files", "False")
-    table.add_row("--pending-matches", "Only process pending matches list", "False")
-    table.add_row("--ignore-file PATH", "Path to ignored_titles.jsonc", "logs/ignored_titles.jsonc")
-    table.add_row(
-        "--pending-matches-path PATH", "Path to pending_matches.jsonc", "logs/pending_matches.jsonc"
-    )
-    table.add_section()
-
-    # --- Caching Options ---
-    table.add_row("[bold]Caching Options[/bold]", "", "")
-    table.add_row("--frequency-days DAYS", "Days before cache considered stale", "30")
-    table.add_row("--tvdb-frequency DAYS", "Days before retry for missing TVDb IDs", "7")
-    table.add_row("--clear-cache", "Delete cache before running", "False")
-    table.add_row("--no-cache", "Skip loading/saving cache", "False")
-    table.add_row("--prune", "Prune orphaned cache entries", "False")
-    table.add_row("--purge", 'Delete cache by TMDB ID, "Title (Year)", or "Title"', "")
-    table.add_row("--cache-path PATH", "Custom cache file path", "cache/idarr_cache.db")
-    table.add_section()
-
-    # --- Filtering Options ---
-    table.add_row("[bold]Filtering Options[/bold]", "", "")
-    table.add_row("--filter", "Enable filtering mode", "")
-    table.add_row("--type {movie,tv_series,collection}", "Only process a specific media type", "")
-    table.add_row("--year YEAR", "Only process items from this year", "")
-    table.add_row("--contains TEXT", "Only include titles containing text", "")
-    table.add_row("--id ID", "Only items with a specific TMDB/TVDB/IMDB ID", "")
-    table.add_row("--skip-collections", "Skip collection enrichment", "False")
-    table.add_section()
-
-    # --- Export & Recovery ---
-    table.add_row("[bold]Export & Recovery[/bold]", "", "")
-    table.add_row("--show-unmatched", "Show unmatched items", "False")
-    table.add_row("--revert", "Undo file renames using cache", "False")
-    table.add_section()
-
-    # --- Other ---
-    table.add_row("[bold]Other[/bold]", "", "")
-    table.add_row("-h, --help", "Show this help message and exit", "")
-    table.add_row("--version", "Show program's version and exit", "")
-
-    console.print("[bold cyan]IDARR: Poster Asset Renamer & ID Tagger[/bold cyan]")
-    console.print(table)
-    console.print("[bold]Examples:[/bold]")
-    console.print("  python idarr.py --source ./images --dry-run")
-    console.print("  python idarr.py --filter --type movie --year 2023")
-
-
-def env_bool(name: str, default: bool = False) -> bool:
-    val = os.environ.get(name)
-    if val is None:
-        return default
-    return val.lower() in ("1", "true", "yes", "on")
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Enrich and rename media image files using TMDB metadata.",
-        add_help=False,
-    )
-    parser.add_argument("--version", action="version", version=f"idarr.py {FULL_VERSION}")
-    parser.add_argument("-h", "--help", action="store_true", help=argparse.SUPPRESS)
-
-    # --- General Options ---
-    general = parser.add_argument_group("General Options")
-    general.add_argument(
-        "--source",
-        metavar="DIR",
-        type=str,
-        default=os.environ.get("SOURCE_DIR"),
-        help=argparse.SUPPRESS,
-    )
-    general.add_argument(
-        "--tmdb-api-key",
-        metavar="KEY",
-        type=str,
-        default=os.environ.get("TMDB_API_KEY"),
-        help=argparse.SUPPRESS,
-    )
-    general.add_argument(
-        "--dry-run",
-        action="store_true",
-        default=env_bool("DRY_RUN", False),
-        help=argparse.SUPPRESS,
-    )
-    general.add_argument(
-        "--quiet",
-        action="store_true",
-        default=env_bool("QUIET", False),
-        help=argparse.SUPPRESS,
-    )
-    general.add_argument(
-        "--debug",
-        action="store_true",
-        default=env_bool("DEBUG", False),
-        help=argparse.SUPPRESS,
-    )
-    general.add_argument(
-        "--limit",
-        metavar="N",
-        type=int,
-        default=int(os.environ.get("LIMIT")) if os.environ.get("LIMIT") else None,
-        help=argparse.SUPPRESS,
-    )
-    general.add_argument(
-        "--remove-non-image-files",
-        action="store_true",
-        default=env_bool("REMOVE_NON_IMAGE_FILES", False),
-        help=argparse.SUPPRESS,
-    )
-    general.add_argument(
-        "--ignore-file",
-        metavar="PATH",
-        type=str,
-        default=os.environ.get("IGNORE_FILE", os.path.join(LOG_DIR, "ignored_titles.jsonc")),
-        help=argparse.SUPPRESS,
-    )
-    general.add_argument(
-        "--pending-matches",
-        action="store_true",
-        default=env_bool("PENDING_MATCHES", False),
-        help="Only process and resolve pending matches (including renaming just-resolved entries).",
-    )
-    general.add_argument(
-        "--pending-matches-path",
-        metavar="PATH",
-        type=str,
-        default=os.environ.get("PENDING_MATCHES_PATH", PENDING_MATCHES_PATH),
-        help=argparse.SUPPRESS,
-    )
-
-    # --- Caching Options ---
-    cache = parser.add_argument_group("Caching Options")
-    cache.add_argument(
-        "--frequency-days",
-        metavar="DAYS",
-        type=int,
-        default=int(os.environ.get("FREQUENCY_DAYS", "30")),
-        help=argparse.SUPPRESS,
-    )
-    cache.add_argument(
-        "--tvdb-frequency",
-        metavar="DAYS",
-        type=int,
-        default=int(os.environ.get("TVDB_FREQUENCY", "7")),
-        help=argparse.SUPPRESS,
-    )
-    cache.add_argument(
-        "--clear-cache",
-        action="store_true",
-        default=env_bool("CLEAR_CACHE", False),
-        help=argparse.SUPPRESS,
-    )
-    cache.add_argument(
-        "--cache-path",
-        metavar="PATH",
-        type=str,
-        default=os.environ.get("CACHE_PATH", CACHE_PATH),
-        help=argparse.SUPPRESS,
-    )
-    cache.add_argument(
-        "--no-cache",
-        action="store_true",
-        default=env_bool("NO_CACHE", False),
-        help=argparse.SUPPRESS,
-    )
-    cache.add_argument(
-        "--prune",
-        action="store_true",
-        default=env_bool("PRUNE", False),
-        help="Prune cache entries not associated with any file in the source directory.",
-    )
-    cache.add_argument(
-        "--purge",
-        type=str,
-        default=os.environ.get("PURGE"),
-        help='Delete cache entries by TMDB ID or by "Title (Year)" or "Title"',
-    )
-
-    # --- Filtering Options ---
-    filtering = parser.add_argument_group("Filtering Options")
-    filtering.add_argument(
-        "--filter",
-        action="store_true",
-        default=env_bool("FILTER", False),
-        help=argparse.SUPPRESS,
-    )
-    filtering.add_argument(
-        "--type",
-        choices=["movie", "tv_series", "collection"],
-        default=os.environ.get("TYPE"),
-        help=argparse.SUPPRESS,
-    )
-    filtering.add_argument(
-        "--year",
-        metavar="YEAR",
-        type=int,
-        default=int(os.environ.get("YEAR")) if os.environ.get("YEAR") else None,
-        help=argparse.SUPPRESS,
-    )
-    filtering.add_argument(
-        "--contains",
-        metavar="TEXT",
-        type=str,
-        default=os.environ.get("CONTAINS"),
-        help=argparse.SUPPRESS,
-    )
-    filtering.add_argument(
-        "--id",
-        metavar="ID",
-        type=str,
-        default=os.environ.get("ID"),
-        help=argparse.SUPPRESS,
-    )
-    filtering.add_argument(
-        "--skip-collections",
-        action="store_true",
-        default=env_bool("SKIP_COLLECTIONS", False),
-        help=argparse.SUPPRESS,
-    )
-
-    # --- Export & Recovery ---
-    extra = parser.add_argument_group("Export & Recovery")
-    extra.add_argument(
-        "--show-unmatched",
-        action="store_true",
-        default=env_bool("SHOW_UNMATCHED", False),
-        help=argparse.SUPPRESS,
-    )
-    extra.add_argument(
-        "--revert",
-        action="store_true",
-        default=env_bool("REVERT", False),
-        help=argparse.SUPPRESS,
-    )
-
-    args = parser.parse_args()
-    if getattr(args, "help", False):
-        print_rich_help()
-        sys.exit(0)
-    return args
-
-
-def load_runtime_config(args: argparse.Namespace) -> IdarrConfig:
-    config = IdarrConfig()
-
-    # General and main runtime flags
-    config.dry_run = getattr(args, "dry_run", False)
-    config.quiet = getattr(args, "quiet", False)
-    config.log_level = "DEBUG" if getattr(args, "debug", False) else "INFO"
-    log.configure(quiet=config.quiet, level=config.log_level)
-
-    config.source_dir = getattr(args, "source", None) or os.environ.get("SOURCE_DIR") or ""
-    config.tmdb_api_key = getattr(args, "tmdb_api_key", None) or os.environ.get("TMDB_API_KEY") or ""
-    config.limit = (
-        getattr(args, "limit", None)
-        if getattr(args, "limit", None) is not None
-        else (int(os.environ.get("LIMIT")) if os.environ.get("LIMIT") else None)
-    )
-    config.remove_non_image_files = getattr(args, "remove_non_image_files", False)
-    config.ignore_file = (
-        getattr(args, "ignore_file", None)
-        or os.environ.get("IGNORE_FILE")
-        or os.path.join(LOG_DIR, "ignored_titles.jsonc")
-    )
-    config.pending_matches_path = (
-        getattr(args, "pending_matches_path", None)
-        or os.environ.get("PENDING_MATCHES_PATH")
-        or PENDING_MATCHES_PATH
-    )
-
-    # Caching
-    config.cache_path = (
-        getattr(args, "cache_path", None)
-        or os.environ.get("CACHE_PATH")
-        or os.path.join(SCRIPT_DIR, "cache", "idarr_cache.json")
-    )
-    config.no_cache = getattr(args, "no_cache", False)
-    config.clear_cache = getattr(args, "clear_cache", False)
-    config.frequency_days = (
-        getattr(args, "frequency_days", None)
-        if getattr(args, "frequency_days", None) is not None
-        else int(os.environ.get("FREQUENCY_DAYS", "30"))
-    )
-    config.tvdb_frequency = (
-        getattr(args, "tvdb_frequency", None)
-        if getattr(args, "tvdb_frequency", None) is not None
-        else int(os.environ.get("TVDB_FREQUENCY", "7"))
-    )
-    config.prune = getattr(args, "prune", False)
-    config.purge = getattr(args, "purge", False)
-
-    # Export/Recovery
-    config.show_unmatched = getattr(args, "show_unmatched", False)
-    config.revert = getattr(args, "revert", False)
-
-    # Filtering (not included in .env, but support CLI as normal)
-    config.filter = getattr(args, "filter", False)
-    config.type = getattr(args, "type", None)
-    config.year = getattr(args, "year", None)
-    config.contains = getattr(args, "contains", None)
-    config.id = getattr(args, "id", None)
-    config.skip_collections = getattr(args, "skip_collections", False)
-
-    # Cache manager
-    config.cache_manager = SQLiteCacheManager(
-        path=config.cache_path, source_dir=config.source_dir, no_cache=config.no_cache
-    )
-    if config.clear_cache and os.path.exists(config.cache_path):
-        os.remove(config.cache_path)
-    config.cache = config.cache_manager.load()
-
-    # TMDB API key prompt (last chance)
-    if not config.tmdb_api_key:
-        try:
-            api_key = Prompt.ask(
-                "[bold yellow]TMDB API key not found. Please enter your TMDB API key[/bold yellow]"
-            )
-            if api_key:
-                config.tmdb_api_key = api_key
-                save = Prompt.ask("Save this API key to .env for future runs? (y/n)", default="y")
-                if save.lower().startswith("y"):
-                    dotenv_path = os.path.join(SCRIPT_DIR, ".env")
-                    with open(dotenv_path, "a") as f:
-                        f.write(f"\nTMDB_API_KEY={api_key}\n")
-                    console.print("[green]✅ Saved API key to .env[/green]")
-        except Exception as e:
-            print("Error prompting for TMDB API key:", e)
-    if not config.tmdb_api_key:
-        raise RuntimeError(
-            "TMDB API key is required. Set via --tmdb-api-key or TMDB_API_KEY environment variable."
-        )
-
-    tmdb_client = TMDbAPIs(config.tmdb_api_key)
-    config.tmdb_query_service = TMDBQueryService(tmdb_client, config)
-
-    def _flush():
-        try:
-            flush_status()
-            config.cache_manager.save(set(config.cache_manager.cache.keys()))
-        except Exception:
-            pass
-
-    atexit.register(_flush)
-
-    def _interrupt(signum, frame):
-        log.info("\n⏹️  Interrupted by user (Ctrl+C). Exiting gracefully.", "YELLOW")
-        _flush()
-        sys.exit(130)
-
-    signal.signal(signal.SIGINT, _interrupt)
-    signal.signal(signal.SIGTERM, _interrupt)
-    return config
-
-
-def print_settings(config: "IdarrConfig") -> None:
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Section", style="cyan", no_wrap=True)
-    table.add_column("Setting", style="green")
-    table.add_column("Value", style="white")
-
-    settings = []
-    # General
-    settings.append(("General", "SOURCE_DIR", str(config.source_dir)))
-    settings.append(("General", "DRY_RUN", str(getattr(config, "dry_run", False))))
-    settings.append(("General", "QUIET", str(getattr(config, "quiet", False))))
-    settings.append(("General", "LOG_LEVEL", str(getattr(config, "log_level", "INFO"))))
-    settings.append(("General", "LIMIT", str(getattr(config, "limit", None))))
-    settings.append(
-        ("General", "REMOVE_NON_IMAGE_FILES", str(getattr(config, "remove_non_image_files", False)))
-    )
-    settings.append(("General", "IGNORE_FILE", str(getattr(config, "ignore_file", ""))))
-    settings.append(("General", "PENDING_MATCHES_PATH", str(PENDING_MATCHES_PATH)))
-
-    # Caching
-    settings.append(("Caching", "CACHE_PATH", str(getattr(config, "cache_path", ""))))
-    settings.append(("Caching", "NO_CACHE", str(getattr(config, "no_cache", False))))
-    settings.append(("Caching", "CLEAR_CACHE", str(getattr(config, "clear_cache", False))))
-    settings.append(("Caching", "FREQUENCY_DAYS", str(getattr(config, "frequency_days", 30))))
-    settings.append(("Caching", "TVDB_FREQUENCY", str(getattr(config, "tvdb_frequency", 7))))
-    settings.append(("Caching", "PRUNE", str(getattr(config, "prune", False))))
-    settings.append(("Caching", "PURGE", str(getattr(config, "purge", False))))
-    settings.append(("Caching", "CACHE_ENTRIES", str(len(getattr(config, "cache", {})))))
-
-    # Export/Recovery
-    settings.append(("Export/Recovery", "SHOW_UNMATCHED", str(getattr(config, "show_unmatched", False))))
-    settings.append(("Export/Recovery", "REVERT", str(getattr(config, "revert", False))))
-
-    # TMDB
-    settings.append(("TMDB", "TMDB_API_KEY", "********" if getattr(config, "tmdb_api_key", None) else None))
-
-    # Filtering
-    if getattr(config, "filter", False):
-        settings.append(("Filtering", "FILTER", "True"))
-        if getattr(config, "type", None) is not None:
-            settings.append(("Filtering", "TYPE", str(config.type)))
-        if getattr(config, "year", None) is not None:
-            settings.append(("Filtering", "YEAR", str(config.year)))
-        if getattr(config, "contains", None) is not None:
-            settings.append(("Filtering", "CONTAINS", str(config.contains)))
-        if getattr(config, "id", None) is not None:
-            settings.append(("Filtering", "ID", str(config.id)))
-
-    # Paths (optional/for debugging)
-    if hasattr(config, "script_dir"):
-        settings.append(("Paths", "SCRIPT_DIR", str(config.script_dir)))
-    if hasattr(config, "log_dir"):
-        settings.append(("Paths", "LOG_DIR", str(config.log_dir)))
-
-    console.print("[bold blue]🔧 Current Settings[/bold blue]\n")
-    for section, setting, value in settings:
-        table.add_row(section, setting, value)
-
-    if config.log_level == "DEBUG":
-        section_width = max(len(str(s[0])) for s in settings + [("Section", "", "")])
-        setting_width = max(len(str(s[1])) for s in settings + [("", "Setting", "")])
-        value_width = max(len(str(s[2])) if s[2] is not None else 0 for s in settings + [("", "", "Value")])
-        header = f"{'Section'.ljust(section_width)} | {'Setting'.ljust(setting_width)} | {'Value'.ljust(value_width)}"
-        sep = "-" * len(header)
-        log.debug("🔧 Current Settings")
-        log.debug(header)
-        log.debug(sep)
-        for section, setting, value in settings:
-            val_str = str(value) if value is not None else ""
-            log.debug(
-                f"{section.ljust(section_width)} | {setting.ljust(setting_width)} | {val_str.ljust(value_width)}"
-            )
-    console.print(table)
 
 
 def perform_revert(config: "IdarrConfig", items: list["MediaItem"]) -> bool:
@@ -3082,7 +2771,7 @@ def load_ignore_and_sync_pending(config: "IdarrConfig") -> tuple[set[str], dict[
 
         # Set as ignored in cache
         m = re.match(TITLE_YEAR_REGEX, ignored_key)
-        title = m.group(1)
+        title = m.group(1) if m else ignored_key
         year = int(m.group(2)) if m and m.group(2) else None
         for cache_key, entry in config.cache.items():
             if entry.get("title") == title and (
@@ -3100,7 +2789,6 @@ def load_ignore_and_sync_pending(config: "IdarrConfig") -> tuple[set[str], dict[
                     )
 
     # 4. Handle removed from ignore list: should be re-added to pending if not found in cache
-    # (We compare cache for ignored items that are no longer ignored, and revert their status, add to pending)
     previously_ignored = set()
     if os.path.exists(config.cache_manager.db_path):
         for cache_key, entry in config.cache.items():
@@ -3117,7 +2805,7 @@ def load_ignore_and_sync_pending(config: "IdarrConfig") -> tuple[set[str], dict[
         if was_ignored not in ignored_title_keys:
             # Remove "ignored" status from cache
             m = re.match(TITLE_YEAR_REGEX, was_ignored)
-            title = m.group(1)
+            title = m.group(1) if m else was_ignored
             year = int(m.group(2)) if m and m.group(2) else None
             for cache_key, entry in config.cache.items():
                 if entry.get("title") == title and (
@@ -3125,22 +2813,25 @@ def load_ignore_and_sync_pending(config: "IdarrConfig") -> tuple[set[str], dict[
                 ):
                     # If item is not "found" or "matched" (i.e., not resolved), put back to pending
                     if entry.get("status") == "ignored":
-                        entry["status"] = "unknown"
+                        entry["status"] = "not_found"
                         config.cache_manager.upsert(
                             cache_key,
                             {
                                 **entry,
-                                "status": "unknown",
+                                "status": "not_found",
                                 "last_checked": datetime.now().isoformat(),
                             },
                         )
                     # Add to pending_matches if not already matched/found
                     if was_ignored not in pending_matches:
-                        pending_matches[was_ignored] = "add_tmdb_url_here"
+                        files = ""
+                        # Try to find file from cache
+                        fs = entry.get("current_filenames", [])
+                        files = fs[0] if isinstance(fs, list) and fs else ""
+                        pending_matches[was_ignored] = make_pending_entry(title, year, files)
                         log.info(
                             f"🔄 Restored '{was_ignored}' to pending_matches (removed from ignore list)."
                         )
-
     save_pending_matches(pending_matches, pending_file)
 
     return ignored_title_keys, pending_matches
@@ -3149,12 +2840,6 @@ def load_ignore_and_sync_pending(config: "IdarrConfig") -> tuple[set[str], dict[
 def resolve_pending_matches(config):
     """
     Resolve pending matches by updating cache with user-supplied TMDB URLs/IDs.
-    - Always uses the canonical TMDB title/type for the match, not the original pending key.
-    - Logs retitling if the TMDB title differs from the pending match key.
-    - Removes the old entry using the original key from the cache after upsert.
-    - Only supports simple "Old Base Name": "tmdb_url" mapping.
-    Side effects:
-        Modifies cache, writes to IGNORE and PENDING files, updates SQLite.
     """
     ignored = set()
     existing = []
@@ -3185,19 +2870,22 @@ def resolve_pending_matches(config):
     updated = False
 
     for key, value in list(pending.items()):
-        if value == "ignore":
+        # Handle explicit ignore
+        if isinstance(value, dict) and value.get("add_tmdb_url_here") == "ignore":
             m = re.match(TITLE_YEAR_REGEX, key)
-            title = m.group(1)
+            title = m.group(1) if m else key
             year = int(m.group(2)) if m and m.group(2) else None
+            log.info(f"🔄 Ignoring {title}{f' ({year})' if year is not None else ''}")
+            found = False
             for cache_key, entry in config.cache.items():
-                if entry.get("title") == title and (
+                if normalize_with_aliases(entry.get("title", "")) == normalize_with_aliases(title) and (
                     entry.get("year") == year or (year is None and not entry.get("year"))
                 ):
                     config.cache_manager.upsert(
                         cache_key,
                         {
-                            "title": title,
-                            "year": year,
+                            "title": entry.get("title"),
+                            "year": entry.get("year"),
                             "type": entry.get("type"),
                             "tmdb_id": entry.get("tmdb_id"),
                             "tvdb_id": entry.get("tvdb_id"),
@@ -3206,29 +2894,40 @@ def resolve_pending_matches(config):
                             "last_checked": datetime.now().isoformat(),
                         },
                     )
-                    break
+                    found = True
+                    updated = True
+            if not found:
+                log.warning(f"[ignore] No cache entry found for '{title}' ({year})")
             ignored.add(key)
             del pending[key]
             continue
-        if value and value != "add_tmdb_url_here":
+
+        # Handle user-provided TMDB URL
+        tmdb_url = None
+        if (
+            isinstance(value, dict)
+            and isinstance(value.get("add_tmdb_url_here"), str)
+            and value.get("add_tmdb_url_here").startswith("https://")
+        ):
+            tmdb_url = value["add_tmdb_url_here"]
+        elif isinstance(value, str) and value != "add_tmdb_url_here" and value.startswith("https://"):
+            tmdb_url = value
+
+        if tmdb_url:
             # Parse TMDB type and ID from URL if present
             pending_type = None
             tmdb_id = None
-            if isinstance(value, str) and "themoviedb.org" in value:
-                # Determine type from URL
-                if "/tv/" in value:
-                    pending_type = "tv_series"
-                elif "/movie/" in value:
-                    pending_type = "movie"
-                elif "/collection/" in value:
-                    pending_type = "collection"
-                # Extract TMDB ID
-                m = re.search(r"/(tv|movie|collection)/(\d+)", value)
-                if m:
-                    tmdb_id = int(m.group(2))
+            if "/tv/" in tmdb_url:
+                pending_type = "tv_series"
+            elif "/movie/" in tmdb_url:
+                pending_type = "movie"
+            elif "/collection/" in tmdb_url:
+                pending_type = "collection"
+            m = re.search(r"/(tv|movie|collection)/(\d+)", tmdb_url)
+            if m:
+                tmdb_id = int(m.group(2))
             else:
-                # Fall back to previous behavior
-                m = re.search(r"(\d+)", value) if isinstance(value, str) else None
+                m = re.search(r"(\d+)", tmdb_url)
                 if m:
                     tmdb_id = int(m.group(1))
             if not tmdb_id:
@@ -3252,7 +2951,6 @@ def resolve_pending_matches(config):
                 del pending[key]
                 continue
 
-            # Use TMDB canonical title/type for the match
             media_item = MediaItem(
                 config=config,
                 type=pending_type if pending_type else entry.get("type", "movie"),
@@ -3263,8 +2961,7 @@ def resolve_pending_matches(config):
                 imdb_id=entry.get("imdb_id"),
                 files=entry.get("current_filenames", []),
             )
-            media_item.enrich()
-            # Always use canonical TMDB title/year/type for the updated entry
+            media_item.enrich(force=True) 
             resolved_title = media_item.new_title or media_item.title
             resolved_year = media_item.new_year if media_item.new_year is not None else media_item.year
             resolved_tmdb_id = (
@@ -3303,7 +3000,6 @@ def resolve_pending_matches(config):
                     "last_checked": datetime.now().isoformat(),
                 },
             )
-            # Remove the old entry using the original key from the cache after upsert
             if old_key in config.cache_manager.cache:
                 config.cache_manager.cache.pop(old_key)
             with sqlite3.connect(config.cache_manager.db_path) as conn:
@@ -3312,7 +3008,21 @@ def resolve_pending_matches(config):
 
             updated = True
             del pending[key]
+            continue
 
+        # Unify all pending entries to the new structure, *removing* any old "candidates"
+        if (
+            isinstance(value, dict)
+            and value.get("add_tmdb_url_here") == "add_tmdb_url_here"
+        ):
+            m = re.match(TITLE_YEAR_REGEX, key)
+            title = m.group(1) if m else key
+            year = int(m.group(2)) if m and m.group(2) else None
+            files = value.get("files", "")
+            pending[key] = make_pending_entry(title, year, files)
+            updated = True
+
+    # Preserve any comment headers in ignored_titles
     header_lines = []
     if os.path.exists(IGNORED_TITLES_PATH):
         with open(IGNORED_TITLES_PATH, encoding="utf-8") as f_in:
@@ -3326,9 +3036,9 @@ def resolve_pending_matches(config):
             f_out.write(comment + "\n")
         json.dump(sorted(ignored), f_out, indent=2, ensure_ascii=False)
         f_out.write("\n")
-
     if updated:
         config.cache = config.cache_manager.cache
+        config.pending_matches = pending
     save_pending_matches(pending, PENDING_MATCHES_PATH)
 
 
@@ -3428,13 +3138,459 @@ def handle_special_arguments(args, config, ignored_title_keys):
         else:
             log.info("No newly resolved pending matches to process.")
         sys.exit(0)
-        sys.exit(0)
     if getattr(args, "revert", False):
         items = scan_files_in_flat_folder(config)
         items = filter_items(args, items)
         if items:
             perform_revert(config, items)
         sys.exit(0)
+
+
+def print_rich_help() -> None:
+    table = Table(show_header=True, header_style="bold purple")
+    table.add_column("Option", style="green", no_wrap=True)
+    table.add_column("Description", style="white")
+    table.add_column("Default Value", style="yellow")
+
+    # --- General Options ---
+    table.add_row("[bold]General Options[/bold]", "", "")
+    table.add_row("--source DIR", "Directory of input image files", "Required/.env file")
+    table.add_row("--tmdb-api-key KEY", "TMDB API key override", "Required/.env file")
+    table.add_row("--dry-run", "Simulate changes (no actual file ops)", "False")
+    table.add_row("--quiet", "Suppress output except progress bars", "False")
+    table.add_row("--debug", "Enable debug logging", "False")
+    table.add_row("--limit N", "Maximum items to process", "0 (unlimited)")
+    table.add_row("--remove-non-image-files", "Remove non-image files", "False")
+    table.add_row("--pending-matches", "Only process pending matches list", "False")
+    table.add_row("--ignore-file PATH", "Path to ignored_titles.jsonc", "logs/ignored_titles.jsonc")
+    table.add_row(
+        "--pending-matches-path PATH", "Path to pending_matches.jsonc", "logs/pending_matches.jsonc"
+    )
+    table.add_section()
+
+    # --- Caching Options ---
+    table.add_row("[bold]Caching Options[/bold]", "", "")
+    table.add_row("--frequency-days DAYS", "Days before cache considered stale", "30")
+    table.add_row("--tvdb-frequency DAYS", "Days before retry for missing TVDb IDs", "7")
+    table.add_row("--clear-cache", "Delete cache before running", "False")
+    table.add_row("--no-cache", "Skip loading/saving cache", "False")
+    table.add_row("--prune", "Prune orphaned cache entries", "False")
+    table.add_row("--purge", 'Delete cache by TMDB ID, "Title (Year)", or "Title"', "")
+    table.add_row("--cache-path PATH", "Custom cache file path", "cache/idarr_cache.db")
+    table.add_section()
+
+    # --- Filtering Options ---
+    table.add_row("[bold]Filtering Options[/bold]", "", "")
+    table.add_row("--filter", "Enable filtering mode", "")
+    table.add_row("--type {movie,tv_series,collection}", "Only process a specific media type", "")
+    table.add_row("--year YEAR", "Only process items from this year", "")
+    table.add_row("--contains TEXT", "Only include titles containing text", "")
+    table.add_row("--id ID", "Only items with a specific TMDB/TVDB/IMDB ID", "")
+    table.add_row("--skip-collections", "Skip collection enrichment", "False")
+    table.add_section()
+
+    # --- Export & Recovery ---
+    table.add_row("[bold]Export & Recovery[/bold]", "", "")
+    table.add_row("--show-unmatched", "Show unmatched items", "False")
+    table.add_row("--revert", "Undo file renames using cache", "False")
+    table.add_section()
+
+    # --- Other ---
+    table.add_row("[bold]Other[/bold]", "", "")
+    table.add_row("-h, --help", "Show this help message and exit", "")
+    table.add_row("--version", "Show program's version and exit", "")
+
+    console.print("[bold cyan]IDARR: Poster Asset Renamer & ID Tagger[/bold cyan]")
+    console.print(table)
+    console.print("[bold]Examples:[/bold]")
+    console.print("  python idarr.py --source ./images --dry-run")
+    console.print("  python idarr.py --filter --type movie --year 2023")
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.lower() in ("1", "true", "yes", "on")
+
+
+def load_runtime_config(args: argparse.Namespace) -> IdarrConfig:
+    config = IdarrConfig()
+
+    # General and main runtime flags
+    config.dry_run = getattr(args, "dry_run", False)
+    config.quiet = getattr(args, "quiet", False)
+    config.log_level = "DEBUG" if getattr(args, "debug", False) else "INFO"
+    log.configure(quiet=config.quiet, level=config.log_level)
+
+    config.source_dir = getattr(args, "source", None) or os.environ.get("SOURCE_DIR") or ""
+    config.tmdb_api_key = getattr(args, "tmdb_api_key", None) or os.environ.get("TMDB_API_KEY") or ""
+    config.limit = (
+        getattr(args, "limit", None)
+        if getattr(args, "limit", None) is not None
+        else (int(os.environ.get("LIMIT")) if os.environ.get("LIMIT") else None)
+    )
+    config.remove_non_image_files = getattr(args, "remove_non_image_files", False)
+    config.ignore_file = (
+        getattr(args, "ignore_file", None)
+        or os.environ.get("IGNORE_FILE")
+        or os.path.join(LOG_DIR, "ignored_titles.jsonc")
+    )
+    config.pending_matches_path = (
+        getattr(args, "pending_matches_path", None)
+        or os.environ.get("PENDING_MATCHES_PATH")
+        or PENDING_MATCHES_PATH
+    )
+
+    # Caching
+    config.cache_path = (
+        getattr(args, "cache_path", None)
+        or os.environ.get("CACHE_PATH")
+        or os.path.join(SCRIPT_DIR, "cache", "idarr_cache.json")
+    )
+    config.no_cache = getattr(args, "no_cache", False)
+    config.clear_cache = getattr(args, "clear_cache", False)
+    config.frequency_days = (
+        getattr(args, "frequency_days", None)
+        if getattr(args, "frequency_days", None) is not None
+        else int(os.environ.get("FREQUENCY_DAYS", "30"))
+    )
+    config.tvdb_frequency = (
+        getattr(args, "tvdb_frequency", None)
+        if getattr(args, "tvdb_frequency", None) is not None
+        else int(os.environ.get("TVDB_FREQUENCY", "7"))
+    )
+    config.prune = getattr(args, "prune", False)
+    config.purge = getattr(args, "purge", False)
+
+    # Export/Recovery
+    config.show_unmatched = getattr(args, "show_unmatched", False)
+    config.revert = getattr(args, "revert", False)
+
+    # Filtering (not included in .env, but support CLI as normal)
+    config.filter = getattr(args, "filter", False)
+    config.type = getattr(args, "type", None)
+    config.year = getattr(args, "year", None)
+    config.contains = getattr(args, "contains", None)
+    config.id = getattr(args, "id", None)
+    config.skip_collections = getattr(args, "skip_collections", False)
+
+    # Cache manager
+    config.cache_manager = SQLiteCacheManager(
+        path=config.cache_path, source_dir=config.source_dir, no_cache=config.no_cache
+    )
+    if config.clear_cache and os.path.exists(config.cache_path):
+        os.remove(config.cache_path)
+    config.cache = config.cache_manager.load()
+
+    # TMDB API key prompt (last chance)
+    if not config.tmdb_api_key:
+        try:
+            api_key = Prompt.ask(
+                "[bold yellow]TMDB API key not found. Please enter your TMDB API key[/bold yellow]"
+            )
+            if api_key:
+                config.tmdb_api_key = api_key
+                save = Prompt.ask("Save this API key to .env for future runs? (y/n)", default="y")
+                if save.lower().startswith("y"):
+                    dotenv_path = os.path.join(SCRIPT_DIR, ".env")
+                    with open(dotenv_path, "a") as f:
+                        f.write(f"\nTMDB_API_KEY={api_key}\n")
+                    console.print("[green]✅ Saved API key to .env[/green]")
+        except Exception as e:
+            print("Error prompting for TMDB API key:", e)
+    if not config.tmdb_api_key:
+        raise RuntimeError(
+            "TMDB API key is required. Set via --tmdb-api-key or TMDB_API_KEY environment variable."
+        )
+
+    tmdb_client = TMDbAPIs(config.tmdb_api_key)
+    config.tmdb_query_service = TMDBQueryService(tmdb_client, config)
+
+    def _flush():
+        try:
+            flush_status()
+            config.cache_manager.save(set(config.cache_manager.cache.keys()))
+            if hasattr(config, "pending_matches"):
+                save_pending_matches(
+                    config.pending_matches, getattr(config, "pending_matches_path", PENDING_MATCHES_PATH)
+                )
+        except Exception:
+            pass
+
+    atexit.register(_flush)
+
+    def _interrupt(signum, frame):
+        log.info("\n⏹️  Interrupted by user (Ctrl+C). Exiting gracefully.", "YELLOW")
+        _flush()
+        sys.exit(130)
+
+    signal.signal(signal.SIGINT, _interrupt)
+    signal.signal(signal.SIGTERM, _interrupt)
+    return config
+
+
+def print_settings(config: "IdarrConfig") -> None:
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Section", style="cyan", no_wrap=True)
+    table.add_column("Setting", style="green")
+    table.add_column("Value", style="white")
+
+    settings = []
+    # General
+    settings.append(("General", "SOURCE_DIR", str(config.source_dir)))
+    settings.append(("General", "DRY_RUN", str(getattr(config, "dry_run", False))))
+    settings.append(("General", "QUIET", str(getattr(config, "quiet", False))))
+    settings.append(("General", "LOG_LEVEL", str(getattr(config, "log_level", "INFO"))))
+    settings.append(("General", "LIMIT", str(getattr(config, "limit", None))))
+    settings.append(
+        ("General", "REMOVE_NON_IMAGE_FILES", str(getattr(config, "remove_non_image_files", False)))
+    )
+    settings.append(("General", "IGNORE_FILE", str(getattr(config, "ignore_file", ""))))
+    settings.append(("General", "PENDING_MATCHES_PATH", str(PENDING_MATCHES_PATH)))
+
+    # Caching
+    settings.append(("Caching", "CACHE_PATH", str(getattr(config, "cache_path", ""))))
+    settings.append(("Caching", "NO_CACHE", str(getattr(config, "no_cache", False))))
+    settings.append(("Caching", "CLEAR_CACHE", str(getattr(config, "clear_cache", False))))
+    settings.append(("Caching", "FREQUENCY_DAYS", str(getattr(config, "frequency_days", 30))))
+    settings.append(("Caching", "TVDB_FREQUENCY", str(getattr(config, "tvdb_frequency", 7))))
+    settings.append(("Caching", "PRUNE", str(getattr(config, "prune", False))))
+    settings.append(("Caching", "PURGE", str(getattr(config, "purge", False))))
+    settings.append(("Caching", "CACHE_ENTRIES", str(len(getattr(config, "cache", {})))))
+
+    # Export/Recovery
+    settings.append(("Export/Recovery", "SHOW_UNMATCHED", str(getattr(config, "show_unmatched", False))))
+    settings.append(("Export/Recovery", "REVERT", str(getattr(config, "revert", False))))
+
+    # TMDB
+    settings.append(("TMDB", "TMDB_API_KEY", "********" if getattr(config, "tmdb_api_key", None) else None))
+
+    # Filtering
+    if getattr(config, "filter", False):
+        settings.append(("Filtering", "FILTER", "True"))
+        if getattr(config, "type", None) is not None:
+            settings.append(("Filtering", "TYPE", str(config.type)))
+        if getattr(config, "year", None) is not None:
+            settings.append(("Filtering", "YEAR", str(config.year)))
+        if getattr(config, "contains", None) is not None:
+            settings.append(("Filtering", "CONTAINS", str(config.contains)))
+        if getattr(config, "id", None) is not None:
+            settings.append(("Filtering", "ID", str(config.id)))
+
+    # Paths (optional/for debugging)
+    if hasattr(config, "script_dir"):
+        settings.append(("Paths", "SCRIPT_DIR", str(config.script_dir)))
+    if hasattr(config, "log_dir"):
+        settings.append(("Paths", "LOG_DIR", str(config.log_dir)))
+
+    console.print("[bold blue]🔧 Current Settings[/bold blue]\n")
+    for section, setting, value in settings:
+        table.add_row(section, setting, value)
+
+    if config.log_level == "DEBUG":
+        section_width = max(len(str(s[0])) for s in settings + [("Section", "", "")])
+        setting_width = max(len(str(s[1])) for s in settings + [("", "Setting", "")])
+        value_width = max(len(str(s[2])) if s[2] is not None else 0 for s in settings + [("", "", "Value")])
+        header = f"{'Section'.ljust(section_width)} | {'Setting'.ljust(setting_width)} | {'Value'.ljust(value_width)}"
+        sep = "-" * len(header)
+        log.debug("🔧 Current Settings")
+        log.debug(header)
+        log.debug(sep)
+        for section, setting, value in settings:
+            val_str = str(value) if value is not None else ""
+            log.debug(
+                f"{section.ljust(section_width)} | {setting.ljust(setting_width)} | {val_str.ljust(value_width)}"
+            )
+    console.print(table)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Enrich and rename media image files using TMDB metadata.",
+        add_help=False,
+    )
+    parser.add_argument("--version", action="version", version=f"idarr.py {FULL_VERSION}")
+    parser.add_argument("-h", "--help", action="store_true", help=argparse.SUPPRESS)
+
+    # --- General Options ---
+    general = parser.add_argument_group("General Options")
+    general.add_argument(
+        "--source",
+        metavar="DIR",
+        type=str,
+        default=os.environ.get("SOURCE_DIR"),
+        help=argparse.SUPPRESS,
+    )
+    general.add_argument(
+        "--tmdb-api-key",
+        metavar="KEY",
+        type=str,
+        default=os.environ.get("TMDB_API_KEY"),
+        help=argparse.SUPPRESS,
+    )
+    general.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=env_bool("DRY_RUN", False),
+        help=argparse.SUPPRESS,
+    )
+    general.add_argument(
+        "--quiet",
+        action="store_true",
+        default=env_bool("QUIET", False),
+        help=argparse.SUPPRESS,
+    )
+    general.add_argument(
+        "--debug",
+        action="store_true",
+        default=env_bool("DEBUG", False),
+        help=argparse.SUPPRESS,
+    )
+    general.add_argument(
+        "--limit",
+        metavar="N",
+        type=int,
+        default=int(os.environ.get("LIMIT")) if os.environ.get("LIMIT") else None,
+        help=argparse.SUPPRESS,
+    )
+    general.add_argument(
+        "--remove-non-image-files",
+        action="store_true",
+        default=env_bool("REMOVE_NON_IMAGE_FILES", False),
+        help=argparse.SUPPRESS,
+    )
+    general.add_argument(
+        "--ignore-file",
+        metavar="PATH",
+        type=str,
+        default=os.environ.get("IGNORE_FILE", os.path.join(LOG_DIR, "ignored_titles.jsonc")),
+        help=argparse.SUPPRESS,
+    )
+    general.add_argument(
+        "--pending-matches",
+        action="store_true",
+        default=env_bool("PENDING_MATCHES", False),
+        help="Only process and resolve pending matches (including renaming just-resolved entries).",
+    )
+    general.add_argument(
+        "--pending-matches-path",
+        metavar="PATH",
+        type=str,
+        default=os.environ.get("PENDING_MATCHES_PATH", PENDING_MATCHES_PATH),
+        help=argparse.SUPPRESS,
+    )
+
+    # --- Caching Options ---
+    cache = parser.add_argument_group("Caching Options")
+    cache.add_argument(
+        "--frequency-days",
+        metavar="DAYS",
+        type=int,
+        default=int(os.environ.get("FREQUENCY_DAYS", "30")),
+        help=argparse.SUPPRESS,
+    )
+    cache.add_argument(
+        "--tvdb-frequency",
+        metavar="DAYS",
+        type=int,
+        default=int(os.environ.get("TVDB_FREQUENCY", "7")),
+        help=argparse.SUPPRESS,
+    )
+    cache.add_argument(
+        "--clear-cache",
+        action="store_true",
+        default=env_bool("CLEAR_CACHE", False),
+        help=argparse.SUPPRESS,
+    )
+    cache.add_argument(
+        "--cache-path",
+        metavar="PATH",
+        type=str,
+        default=os.environ.get("CACHE_PATH", CACHE_PATH),
+        help=argparse.SUPPRESS,
+    )
+    cache.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=env_bool("NO_CACHE", False),
+        help=argparse.SUPPRESS,
+    )
+    cache.add_argument(
+        "--prune",
+        action="store_true",
+        default=env_bool("PRUNE", False),
+        help="Prune cache entries not associated with any file in the source directory.",
+    )
+    cache.add_argument(
+        "--purge",
+        type=str,
+        default=os.environ.get("PURGE"),
+        help='Delete cache entries by TMDB ID or by "Title (Year)" or "Title"',
+    )
+
+    # --- Filtering Options ---
+    filtering = parser.add_argument_group("Filtering Options")
+    filtering.add_argument(
+        "--filter",
+        action="store_true",
+        default=env_bool("FILTER", False),
+        help=argparse.SUPPRESS,
+    )
+    filtering.add_argument(
+        "--type",
+        choices=["movie", "tv_series", "collection"],
+        default=os.environ.get("TYPE"),
+        help=argparse.SUPPRESS,
+    )
+    filtering.add_argument(
+        "--year",
+        metavar="YEAR",
+        type=int,
+        default=int(os.environ.get("YEAR")) if os.environ.get("YEAR") else None,
+        help=argparse.SUPPRESS,
+    )
+    filtering.add_argument(
+        "--contains",
+        metavar="TEXT",
+        type=str,
+        default=os.environ.get("CONTAINS"),
+        help=argparse.SUPPRESS,
+    )
+    filtering.add_argument(
+        "--id",
+        metavar="ID",
+        type=str,
+        default=os.environ.get("ID"),
+        help=argparse.SUPPRESS,
+    )
+    filtering.add_argument(
+        "--skip-collections",
+        action="store_true",
+        default=env_bool("SKIP_COLLECTIONS", False),
+        help=argparse.SUPPRESS,
+    )
+
+    # --- Export & Recovery ---
+    extra = parser.add_argument_group("Export & Recovery")
+    extra.add_argument(
+        "--show-unmatched",
+        action="store_true",
+        default=env_bool("SHOW_UNMATCHED", False),
+        help=argparse.SUPPRESS,
+    )
+    extra.add_argument(
+        "--revert",
+        action="store_true",
+        default=env_bool("REVERT", False),
+        help=argparse.SUPPRESS,
+    )
+
+    args = parser.parse_args()
+    if getattr(args, "help", False):
+        print_rich_help()
+        sys.exit(0)
+    return args
 
 
 def main():
