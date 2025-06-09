@@ -581,7 +581,6 @@ class TMDBQueryService:
             return None
         tried.add(key)
         self._log_search_attempt(search.title, search.year, media_type, is_new_attempt)
-
         try:
             # === Step 1: Direct TMDB ID Lookup ===
             if getattr(search, "match_reason", None) == "ambiguous":
@@ -1705,76 +1704,39 @@ def make_pending_entry(title, year=None, files=None):
         "files": file_str,
     }
 
-def update_pending_matches_from_cache(config) -> dict[str, str]:
+def rebuild_pending_matches(config):
     """
-    Update pending matches dict:
-    - If user has filled in a TMDB URL (string or dict), preserve it.
-    - For all other unresolved keys, use a standard pending entry with make_pending_entry.
+    Rebuilds pending_matches so it contains only unresolved cache items
+    (status 'not_found' or 'tmdb_removed'), adding missing ones and
+    removing entries that are no longer unresolved.
+    Preserves user-supplied values for unresolved items.
     """
-    pending_file = getattr(config, "pending_matches_path", None) or PENDING_MATCHES_PATH
-    prev_pending = {}
-    if os.path.exists(pending_file):
-        try:
-            with open(pending_file, encoding="utf-8") as f:
-                lines = [line for line in f if not line.lstrip().startswith("//")]
-                file_content = "".join(lines)
-                prev_pending = json.loads(file_content)
-        except Exception:
-            prev_pending = {}
-
     cache = getattr(config, "cache", {})
-    pending = {}
-
-    # Collect unresolved (not_found or tmdb_removed) keys from cache
+    prev_pending = getattr(config, "pending_matches", {})
+    # First: Collect keys for all unresolved cache entries
     unresolved_keys = set()
+    new_pending = {}
+
     for entry in cache.values():
         status = entry.get("status", "not_found")
-        if status in ("not_found", "tmdb_removed"):
-            title = entry.get("title", "")
-            year = entry.get("year")
-            key = f"{title} ({year})" if title and year else title
-            unresolved_keys.add(key)
-
-    for key in unresolved_keys:
-        existing_entry = prev_pending.get(key)
-
-        # If previous entry exists and user has filled in a TMDB URL, preserve it
-        #   - Either as a string (TMDB URL) or dict with non-empty "add_tmdb_url_here"
-        if existing_entry:
-            if isinstance(existing_entry, str):
-                if existing_entry.strip().startswith("http"):
-                    pending[key] = existing_entry
-                    continue
-            elif isinstance(existing_entry, dict):
-                url = existing_entry.get("add_tmdb_url_here", "")
-                if isinstance(url, str) and url.strip().startswith("http"):
-                    pending[key] = existing_entry
-                    continue
-                # Also preserve dict if user is mid-entry (e.g. custom info)
-                pending[key] = existing_entry
-                continue
-
-        # Default: use the unified make_pending_entry
-        title, year = key, None
-        m = re.match(TITLE_YEAR_REGEX, key)
-        if m:
-            title = m.group(1)
-            year = int(m.group(2)) if m.group(2) else None
-        files = ""
-        entry = None
-        for e in cache.values():
-            t = e.get("title", "")
-            y = e.get("year", None)
-            k = f"{t} ({y})" if t and y else t
-            if k == key:
-                entry = e
-                break
-        if isinstance(entry, dict):
+        if status not in ("not_found", "tmdb_removed"):
+            continue
+        title = entry.get("title", "")
+        year = entry.get("year")
+        key = f"{title} ({year})" if title and year else title
+        unresolved_keys.add(key)
+        if key in prev_pending:
+            # Keep existing user-supplied entry
+            new_pending[key] = prev_pending[key]
+        else:
+            # Add a new default pending entry
+            files = ""
             fns = entry.get("current_filenames", [])
-            files = fns[0] if isinstance(fns, list) and fns else ""
-        pending[key] = make_pending_entry(title, year, files)
-
-    return pending
+            if isinstance(fns, list) and fns:
+                files = fns[0]
+            new_pending[key] = make_pending_entry(title, year, files)
+    # Only unresolved keys are included; all others are dropped
+    config.pending_matches = new_pending
 
 
 def strip_tags_and_rename(filenames, dry_run=False, log=None):
@@ -1844,9 +1806,13 @@ def normalize_with_aliases(string: str) -> str:
 
     def to_lower_strip_spaces(s: str) -> str:
         return re.sub(r"\s+", " ", s).strip().lower()
+    
+    def remove_colon(s: str) -> str:
+        return s.replace(":", "")
 
     s = string
     s = remove_apostrophes(s)
+    s = remove_colon(s)
     s = to_ascii(s)
     s = canonicalize_tokens(s)
     s = to_lower_strip_spaces(s)
@@ -2163,7 +2129,6 @@ def handle_data(config: "IdarrConfig", items: list["MediaItem"]) -> list["MediaI
                     )
 
     config.pending_matches = pending_matches
-    save_pending_matches(config.pending_matches)
 
     if config.show_unmatched and UNMATCHED_CASES:
         for case in UNMATCHED_CASES:
@@ -2211,10 +2176,7 @@ def generate_new_filename(media_item: "MediaItem", old_filename: str) -> str:
     name, ext = os.path.splitext(old_filename)
     base = f"{base_title}{f' ({base_year})' if base_year else ''}"
 
-    if media_item.type == "tv_series":
-        new_name = f"{base}{suffix}{season_suffix}{ext}"
-    else:
-        new_name = f"{base}{season_suffix}{suffix}{ext}"
+    new_name = f"{base}{suffix}{season_suffix}{ext}"
 
     forbidden = r'[<>:"/\\|?*\x00-\x1F]'
     cleaned = re.sub(forbidden, "", new_name)
@@ -2472,8 +2434,10 @@ def prune_orphaned_cache_entries(config: IdarrConfig) -> None:
             year = entry.get("year")
             if year:
                 removed_titles.append(f"{title} ({year})")
+                log.info(f"🗑️ Removed orphaned cache entry: {title} ({year})")
             else:
                 removed_titles.append(title)
+                log.info(f"🗑️ Removed orphaned cache entry: {title}")
         if idx % entries_update == 0 or idx == total:
             status.update(f"[cyan]Searching, Please wait... ({idx:,}/{total:,})")
 
@@ -2490,7 +2454,10 @@ def prune_orphaned_cache_entries(config: IdarrConfig) -> None:
             pending_removed += 1
 
     # Save updated pending matches
-    save_pending_matches(pending_matches, pending_file)
+    if removed_titles:
+        log.info("🧹 Orphaned cache entries removed:")
+        for t in removed_titles:
+            log.info(f"   - {t}")
 
     log.info(
         f"✅ Prune operation complete. {len(removed_keys)} entries removed. {pending_removed} pending matches cleaned up."
@@ -2832,7 +2799,6 @@ def load_ignore_and_sync_pending(config: "IdarrConfig") -> tuple[set[str], dict[
                         log.info(
                             f"🔄 Restored '{was_ignored}' to pending_matches (removed from ignore list)."
                         )
-    save_pending_matches(pending_matches, pending_file)
 
     return ignored_title_keys, pending_matches
 
@@ -3039,7 +3005,7 @@ def resolve_pending_matches(config):
     if updated:
         config.cache = config.cache_manager.cache
         config.pending_matches = pending
-    save_pending_matches(pending, PENDING_MATCHES_PATH)
+    rebuild_pending_matches(config)
 
 
 def summarize_run(
@@ -3312,6 +3278,7 @@ def load_runtime_config(args: argparse.Namespace) -> IdarrConfig:
             flush_status()
             config.cache_manager.save(set(config.cache_manager.cache.keys()))
             if hasattr(config, "pending_matches"):
+                rebuild_pending_matches(config)
                 save_pending_matches(
                     config.pending_matches, getattr(config, "pending_matches_path", PENDING_MATCHES_PATH)
                 )
