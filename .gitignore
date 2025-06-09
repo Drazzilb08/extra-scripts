@@ -10,3 +10,4 @@ test*
 pyproject.toml
 .vscode/settings.json
 /__pycache__
+*.zip
