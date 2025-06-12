@@ -720,7 +720,7 @@ main() {
     ls -tp "$log_dir"/plex_backup_*.log 2>/dev/null | grep -v '/$' | tail -n +11 | xargs -r rm --
 
     log_file="$log_dir/plex_backup_$(date +%F@%H.%M).log"
-    exec > >(tee -a "$log_file") 2>&1
+    exec > >(sed 's/\x1b\[[0-9;]*m//g' | tee -a "$log_file") 2>&1
     [ "$use_config_file" == "true" ] && load_config_file
     if [ "$restore_flag" == "true" ] || [ "$test_restore_flag" == "true" ]; then    
         run_restore
