@@ -52,6 +52,25 @@ Example:
 EOF
 }
 
+IS_TTY=false
+if [[ -t 1 ]]; then
+    IS_TTY=true
+fi
+
+log() {
+    local msg="$1"
+    # Strip color codes for log file (ANSI escape sequences)
+    local plain_msg
+    plain_msg="$(echo -e "$msg" | sed -r 's/\x1b\[[0-9;]*m//g')"
+    if [[ -n "$LOG_FILE" ]]; then
+        echo -e "$plain_msg" >> "$LOG_FILE"
+    fi
+    # Only print to terminal if not quiet and output is a TTY
+    if $IS_TTY && [[ "${quiet,,}" != "true" ]]; then
+        echo -e "$msg"
+    fi
+}
+
 ## Handle CLI arguments and map to script variables
 handle_options() {
     bar_color='e5a00d'
@@ -177,31 +196,26 @@ hex_to_decimal() {
     fi
 }
 
-## Print messages if not in quiet mode
-verbose_output() {
-    if [[ "$(echo "$quiet" | tr '[:upper:]' '[:lower:]')" == "false" ]]; then
-        echo -e "$1"
-    fi
-}
+
 
 ## Clean up old backups beyond the retention limit
 cleanup_function() {
-    verbose_output "💣 Cleaning up old backups..."
+    log "💣 Cleaning up old backups..."
     destination_dir=$(realpath -s "$destination_dir")
     if [ -d "$destination_dir/Essential" ]; then
-        verbose_output "🧹 Looking for old Essential backups (keeping last $keep_essential)..."
+        log "🧹 Looking for old Essential backups (keeping last $keep_essential)..."
         find "$destination_dir/Essential" -mindepth 1 -maxdepth 1 -type d | sort -r | tail -n +$(( keep_essential + 1 )) | while read -r dir; do
-            verbose_output "🗑  Removing: $dir"
+            log "🗑  Removing: $dir"
             rm -rf "$dir"
         done
     fi
     if [ -d "$destination_dir"/Full ]; then
-        verbose_output "🧹 Looking for old Full backups (keeping last $keep_full)..."
+        log "🧹 Looking for old Full backups (keeping last $keep_full)..."
         find "$destination_dir/Full" -mindepth 1 -maxdepth 1 -type d | sort -r | tail -n +$(( keep_full + 1 )) | while read -r dir; do
-            verbose_output "🗑  Removing: $dir"
+            log "🗑  Removing: $dir"
             rm -rf "$dir"
         done
-        verbose_output "✅ Done\n"
+        log "✅ Done\n"
     fi
 }
 
@@ -310,32 +324,58 @@ payload() {
 ## Perform a Zstandard compressed backup
 zst_backup() {
     extension="zst"
-    verbose_output "📦 Creating Zstandard archive..."
+    if [ "$dry_run" == "true" ]; then
+        extension+=".dry_run"
+        log "🧪 Dry run: Creating dummy file at: $backup_path/$folder_type-plex_backup.$extension"
+        touch "$backup_path/$folder_type-plex_backup.$extension"
+        return
+    fi
+    log "📦 Creating Zstandard archive..."
     dir_size=$(cd "$source_dir" && du -sb --exclude="${exclude[*]#--exclude=}" "${backup_source[@]}" 2>/dev/null | awk '{sum+=$1} END{print sum}')
     
     if [[ -z "$dir_size" || "$dir_size" -eq 0 ]]; then
-        echo "❌ ERROR: Nothing to archive. The source may be empty or incorrectly specified."
+        log "❌ ERROR: Nothing to archive. The source may be empty or incorrectly specified."
         backup_failed=true
         return
     fi
 
-    ( cd "$source_dir" &&
-        tar --ignore-failed-read -cf - --transform "s|^|$base_dir_name/|" "${exclude[@]}" "${backup_source[@]}"
-    ) | \
-    pv --size "$dir_size" --progress --timer --rate --eta --bytes --name BACKUP --force --width "$(($(tput cols)-10))" 2> >(test -t 2 && cat >&2 || cat >/dev/null) | \
-    zstd -q --threads=0 -19 -o "$backup_path/$folder_type-plex_backup.zst"
+    if $IS_TTY; then
+        ( cd "$source_dir" &&
+            tar --ignore-failed-read -cf - --transform "s|^|$base_dir_name/|" "${exclude[@]}" "${backup_source[@]}"
+        ) | \
+        pv --size "$dir_size" --progress --timer --rate --eta --bytes --name BACKUP --force --width "$(($(tput cols)-10))" | \
+        zstd -q --threads=0 -19 -o "$backup_path/$folder_type-plex_backup.zst"
+    else
+        ( cd "$source_dir" &&
+            tar --ignore-failed-read -cf - --transform "s|^|$base_dir_name/|" "${exclude[@]}" "${backup_source[@]}"
+        ) | \
+        zstd -q --threads=0 -19 -o "$backup_path/$folder_type-plex_backup.zst"
+    fi
 }
 
 ## Perform a 7z compressed backup
 7z_backup() {
     extension="7z"
-    verbose_output "📦 Creating 7z archive..."
+    if [ "$dry_run" == "true" ]; then
+        extension+=".dry_run"
+        log "🧪 Dry run: Creating dummy file at: $backup_path/$folder_type-plex_backup.$extension"
+        touch "$backup_path/$folder_type-plex_backup.$extension"
+        return
+    fi
+    log "📦 Creating 7z archive..."
     dir_size=$(cd "$source_dir" && du -sb --exclude="${exclude[*]#--exclude=}" "${backup_source[@]}" | awk '{sum+=$1} END{print sum}')
-    ( cd "$source_dir" &&
-        tar --ignore-failed-read -cf - --transform "s|^|$base_dir_name/|" "${exclude[@]}" "${backup_source[@]}"
-    ) | \
-    pv --size "$dir_size" --progress --timer --rate --eta --bytes --name BACKUP --force --width "$(($(tput cols)-10))" 2> >(test -t 2 && cat >&2 || cat >/dev/null) | \
-    7z a -si -t7z -m0=lzma2 -mx=3 -md=16m -mfb=32 -mmt=on -ms=off "$backup_path/$folder_type-plex_backup.7z" >/dev/null
+    if $IS_TTY; then
+        ( cd "$source_dir" &&
+            tar --ignore-failed-read -cf - --transform "s|^|$base_dir_name/|" "${exclude[@]}" "${backup_source[@]}"
+        ) | \
+        pv --size "$dir_size" --progress --timer --rate --eta --bytes --name BACKUP --force --width "$(($(tput cols)-10))" | \
+        7z a -si -t7z -m0=lzma2 -mx=3 -md=16m -mfb=32 -mmt=on -ms=off "$backup_path/$folder_type-plex_backup.7z" >/dev/null
+    else
+        ( cd "$source_dir" &&
+            tar --ignore-failed-read -cf - --transform "s|^|$base_dir_name/|" "${exclude[@]}" "${backup_source[@]}"
+        ) | \
+        7z a -si -t7z -m0=lzma2 -mx=3 -md=16m -mfb=32 -mmt=on -ms=off "$backup_path/$folder_type-plex_backup.7z" >/dev/null
+    fi
 }
 
 ## Perform a tar archive backup with optional progress
@@ -343,11 +383,11 @@ tar_backup() {
     extension="tar"
     if [ "$dry_run" == "true" ]; then
         extension+=".dry_run"
-        echo "🧪 Dry run: Creating dummy file at: $backup_path/$folder_type-plex_backup.$extension"
+        log "🧪 Dry run: Creating dummy file at: $backup_path/$folder_type-plex_backup.$extension"
         touch "$backup_path/$folder_type-plex_backup.$extension"
     else
-        if command -v pv >/dev/null; then
-            verbose_output "📦 Creating archive..."
+        if $IS_TTY && command -v pv >/dev/null; then
+            log "📦 Creating archive..."
             dir_size=$(cd "$source_dir" && du -sb --exclude="${exclude[*]#--exclude=}" "${backup_source[@]}" | awk '{sum+=$1} END{print sum}')
             ( cd "$source_dir" &&
                 tar --ignore-failed-read \
@@ -357,18 +397,18 @@ tar_backup() {
                 --transform "s|^|$base_dir_name/|" \
                 "${exclude[@]}" "${backup_source[@]}"
             ) | \
-            pv --size "$dir_size" --progress --timer --rate --eta --bytes --name BACKUP --force --width "$(($(tput cols) - 10))" 2> >(test -t 2 && cat >&2 || cat >/dev/null) > "$backup_path/$folder_type-plex_backup.$extension"
+            pv --size "$dir_size" --progress --timer --rate --eta --bytes --name BACKUP --force --width "$(($(tput cols) - 10))" > "$backup_path/$folder_type-plex_backup.$extension"
         else
-            verbose_output "📦 Creating archive..."
+            log "📦 Creating archive..."
             ( cd "$source_dir" &&
                 tar --ignore-failed-read -cf - --transform "s|^|$base_dir_name/|" "${exclude[@]}" "${backup_source[@]}"
             ) > "$backup_path/$folder_type-plex_backup.$extension"
         fi
 
         if tar -tf "$backup_path/$folder_type-plex_backup.$extension" >/dev/null; then
-            verbose_output -e "\n✅ Verified: tar archive is readable"
+            log "\n✅ Verified: tar archive is readable"
         else
-            echo -e "\n❌ ERROR: tar archive verification failed!"
+            log "\n❌ ERROR: tar archive verification failed!"
             backup_failed=true
         fi
     fi
@@ -377,8 +417,8 @@ tar_backup() {
 ## Primary function to create a backup (Essential or Full)
 create_backup() {
     local folder_type=$1
-    verbose_output "\n=============================== 📦 $folder_type Backup ==============================="
-    [ "$dry_run" == "true" ] && verbose_output "🧪 Dry run mode enabled — no files will be created or modified."
+    log "\n=============================== 📦 $folder_type Backup ==============================="
+    [ "$dry_run" == "true" ] && log "🧪 Dry run mode enabled — no files will be created or modified."
     source_dir=${source_dir%/}
     base_dir_name=$(basename "$source_dir")
     start=$(date +%s)
@@ -434,10 +474,10 @@ create_backup() {
         field_builder "Backup Status" "❌ Archive verification failed" "true"
         payload "Backup Failure"
         send_notification
-        verbose_output "❌ Backup verification failed. Notification sent."
+        log "❌ Backup verification failed. Notification sent."
         return
     fi
-    verbose_output "\n✅ Backup complete."
+    log "\n✅ Backup complete."
     calculate_runtime
 
     if [ "$dry_run" == "true" ]; then
@@ -474,13 +514,13 @@ stop_plex() {
 
         get_plex_tyupe
 
-        [[ "${full_backup,,}" == "true" ]] && echo "🔻 Plex detected as: $plex_type"
+        [[ "${full_backup,,}" == "true" ]] && log "🔻 Plex detected as: $plex_type"
 
         if [ "$plex_type" == "docker" ]; then
-            verbose_output "🛑 Stopping Docker Plex..."
+            log "🛑 Stopping Docker Plex..."
             docker stop plex
         elif [ "$plex_type" == "systemctl" ]; then
-            verbose_output "🛑 Stopping systemd Plex..."
+            log "🛑 Stopping systemd Plex..."
             systemctl stop plexmediaserver.service
         fi
 
@@ -500,16 +540,16 @@ start_plex() {
             both) backup_notification="Essential & Full Backup" ;;
         esac
 
-        [[ "${full_backup,,}" == "true" ]] && echo "🔼 Starting Plex ($plex_type)..."
+        [[ "${full_backup,,}" == "true" ]] && log "🔼 Starting Plex ($plex_type)..."
 
         if [ "$plex_type" == "docker" ]; then
-            verbose_output "🚀 Starting Docker Plex..."
+            log "🚀 Starting Docker Plex..."
             docker start plex
         elif [ "$plex_type" == "systemctl" ]; then
-            verbose_output "🚀 Starting systemd Plex..."
+            log "🚀 Starting systemd Plex..."
             systemctl start plexmediaserver.service
         else
-            echo "❌ ERROR: Plex type unknown. Cannot start."
+            log "❌ ERROR: Plex type unknown. Cannot start."
             exit 1
         fi
 
@@ -522,36 +562,36 @@ start_plex() {
 
 ## Display debug output of current variables and runtime state
 debug_output_function() {
-    echo -e "\n===================== DEBUG INFO ====================="
-    printf "%-25s %s\n" "Debug:" "$debug"
-    printf "%-25s %s\n" "Source:" "$source_dir"
-    printf "%-25s %s\n" "Destination:" "$destination_dir"
-    printf "%-25s %s\n" "Keep essential:" "$keep_essential"
-    printf "%-25s %s\n" "Keep full:" "$keep_full"
-    printf "%-25s %s\n" "Full backup:" "$full_backup"
-    printf "%-25s %s\n" "Force full backup:" "$force_full_backup"
-    printf "%-25s %s\n" "Unraid notify:" "$unraid_notify"
-    printf "%-25s %s\n" "Compress:" "$compress"
-    printf "%-25s %s\n" "Dry run:" "$dry_run"
-    printf "%-25s %s\n" "Quiet:" "$quiet"
-    printf "%-25s %s\n" "Webhook:" "$webhook"
-    printf "%-25s %s\n" "Bot name:" "$bot_name"
-    printf "%-25s %s\n" "Channel:" "$channel"
-    printf "%-25s %s\n" "Essential size:" "$essential_backup_size"
-    printf "%-25s %s\n" "Essential total size:" "$essential_backup_total_size"
-    printf "%-25s %s\n" "Full size:" "$full_backup_size"
-    printf "%-25s %s\n" "Full total size:" "$full_backup_total_size"
-    printf "%-25s %s\n" "Days since last full:" "$days"
-    printf "%-25s %s\n" "Bar color (hex):" "$hex_bar_color"
-    printf "%-25s %s\n" "Bar color (decimal):" "$decimal_bar_color"
-    printf "%-25s %s\n" "Timestamp:" "$get_ts"
-    printf "%-25s %s\n" "Last backup recorded:" "$lastbackup"
-    printf "%-25s %s\n" "Backup type:" "$backup_type"
-    printf "%-25s %s\n" "Shutdown Plex:" "$shutdown_plex"
-    printf "%-25s %s\n" "Runtime:" "$run_output"
-    printf "%-25s %s\n" "Config directory:" "$config_dir"
-    printf "%-25s %s\n" "Plex Type:" "$plex_type"
-    echo -e "======================================================\n"
+    log "\n===================== DEBUG INFO ====================="
+    log "$(printf "%-25s %s" "Debug:" "$debug")"
+    log "$(printf "%-25s %s" "Source:" "$source_dir")"
+    log "$(printf "%-25s %s" "Destination:" "$destination_dir")"
+    log "$(printf "%-25s %s" "Keep essential:" "$keep_essential")"
+    log "$(printf "%-25s %s" "Keep full:" "$keep_full")"
+    log "$(printf "%-25s %s" "Full backup:" "$full_backup")"
+    log "$(printf "%-25s %s" "Force full backup:" "$force_full_backup")"
+    log "$(printf "%-25s %s" "Unraid notify:" "$unraid_notify")"
+    log "$(printf "%-25s %s" "Compress:" "$compress")"
+    log "$(printf "%-25s %s" "Dry run:" "$dry_run")"
+    log "$(printf "%-25s %s" "Quiet:" "$quiet")"
+    log "$(printf "%-25s %s" "Webhook:" "$webhook")"
+    log "$(printf "%-25s %s" "Bot name:" "$bot_name")"
+    log "$(printf "%-25s %s" "Channel:" "$channel")"
+    log "$(printf "%-25s %s" "Essential size:" "$essential_backup_size")"
+    log "$(printf "%-25s %s" "Essential total size:" "$essential_backup_total_size")"
+    log "$(printf "%-25s %s" "Full size:" "$full_backup_size")"
+    log "$(printf "%-25s %s" "Full total size:" "$full_backup_total_size")"
+    log "$(printf "%-25s %s" "Days since last full:" "$days")"
+    log "$(printf "%-25s %s" "Bar color (hex):" "$hex_bar_color")"
+    log "$(printf "%-25s %s" "Bar color (decimal):" "$decimal_bar_color")"
+    log "$(printf "%-25s %s" "Timestamp:" "$get_ts")"
+    log "$(printf "%-25s %s" "Last backup recorded:" "$lastbackup")"
+    log "$(printf "%-25s %s" "Backup type:" "$backup_type")"
+    log "$(printf "%-25s %s" "Shutdown Plex:" "$shutdown_plex")"
+    log "$(printf "%-25s %s" "Runtime:" "$run_output")"
+    log "$(printf "%-25s %s" "Config directory:" "$config_dir")"
+    log "$(printf "%-25s %s" "Plex Type:" "$plex_type")"
+    log "======================================================"
 }
 
 
@@ -672,7 +712,7 @@ run_restore() {
         else
             echo "📦 Extracting .tar archive..."
             if command -v pv >/dev/null; then
-                tar --strip-components=1 -xf - -C "$restore_target" < <(pv "$archive" 2> >(test -t 2 && cat >&2 || cat >/dev/null))
+                tar --strip-components=1 -xf - -C "$restore_target" < <(pv "$archive")
             else
                 tar -xf "$archive" -C "$restore_target"
             fi
@@ -719,8 +759,8 @@ main() {
     # Rotate old logs (keep only the 10 most recent)
     ls -tp "$log_dir"/plex_backup_*.log 2>/dev/null | grep -v '/$' | tail -n +11 | xargs -r rm --
 
-    log_file="$log_dir/plex_backup_$(date +%F@%H.%M).log"
-    exec > >(sed 's/\x1b\[[0-9;]*m//g' | tee -a "$log_file") 2>&1
+    LOG_FILE="$log_dir/plex_backup_$(date +%F@%H.%M).log"
+    # exec > >(tee -a "$log_file") 2>&1
     [ "$use_config_file" == "true" ] && load_config_file
     if [ "$restore_flag" == "true" ] || [ "$test_restore_flag" == "true" ]; then    
         run_restore
@@ -728,7 +768,7 @@ main() {
         exit 0
     fi
     # If dry run enabled, print a notice
-    [ "$dry_run" == "true" ] && verbose_output "🧪 Dry run mode enabled — simulation only"
+    [ "$dry_run" == "true" ] && log "🧪 Dry run mode enabled — simulation only"
     # Convert hex color to decimal
     hex_to_decimal "$bar_color"
     # Validate directories and webhook
@@ -769,7 +809,7 @@ main() {
             echo "$current_date" > "$last_plex_backup"
         else
             backup_type="essential_no_full"
-            verbose_output "📆 Skipping full backup (only $days days since last)"
+            log "📆 Skipping full backup (only $days days since last)"
         fi
     else
         # Or just run Full backup
@@ -796,38 +836,38 @@ main() {
     # Print summary and optionally notify or debug
     [[ "${unraid_notify,,}" == "true" ]] && unraid_notification
     [[ "${debug,,}" == "true" ]] && debug_output_function
-    printf "\n==================== ✅ Backup Summary ====================\n"
-    printf "🔁  \e[1;34m%-30s\e[0m %s\n" "Backup Type:" "$backup_type"
-    printf "⏱️   \e[1;34m%-30s\e[0m %s\n" "Runtime:" "$run_output"
-    printf "📁  \e[1;34m%-30s\e[0m %s\n" "Source Directory:" "$source_dir"
-    printf "💾  \e[1;34m%-30s\e[0m %s\n" "Destination Directory:" "$destination_dir"
+    log "\n==================== ✅ Backup Summary ===================="
+    log "$(printf "🔁  %-30s %s" "Backup Type:" "$backup_type")"
+    log "$(printf "⏱️   %-30s %s" "Runtime:" "$run_output")"
+    log "$(printf "📁  %-30s %s" "Source Directory:" "$source_dir")"
+    log "$(printf "💾  %-30s %s" "Destination Directory:" "$destination_dir")"
 
     if [[ "$backup_type" =~ essential|both|essential_no_full ]]; then
-        printf "🧩  \e[1;34m%-30s\e[0m %s\n" "Essential Size:" "$essential_backup_size"
-        printf "📚  \e[1;34m%-30s\e[0m %s\n" "Total Essential Backups:" "$essential_backup_total_size"
+        log "$(printf "🧩  %-30s %s" "Essential Size:" "$essential_backup_size")"
+        log "$(printf "📚  %-30s %s" "Total Essential Backups:" "$essential_backup_total_size")"
     fi
 
     if [[ "$backup_type" =~ full|both ]]; then
-        printf "🗂️   \e[1;34m%-30s\e[0m %s\n" "Full Size:" "$full_backup_size"
-        printf "📦  \e[1;34m%-30s\e[0m %s\n" "Total Full Backups:" "$full_backup_total_size"
+        log "$(printf "🗂️   %-30s %s" "Full Size:" "$full_backup_size")"
+        log "$(printf "📦  %-30s %s" "Total Full Backups:" "$full_backup_total_size")"
     fi
 
-    printf "🗓️   \e[1;34m%-30s\e[0m %s\n" "Days Since Last Full:" "$days"
+    log "$(printf "🗓️   %-30s %s" "Days Since Last Full:" "$days")"
 
     if [[ "${full_backup,,}" == "false" && "$force_full_backup" -ne 0 ]]; then
         next_full=$(( force_full_backup - days ))
         if (( next_full > 0 )); then
-            printf "📅  \e[1;34m%-30s\e[0m in %s day(s)\n" "Next Full Backup:" "$next_full"
+            log "$(printf "📅  %-30s in %s day(s)" "Next Full Backup:" "$next_full")"
         else
-            printf "📅  \e[1;34m%-30s\e[0m %s\n" "Next Full Backup:" "Today (forced by schedule)"
+            log "$(printf "📅  %-30s %s" "Next Full Backup:" "Today (forced by schedule)")"
         fi
     fi
 
-    printf "🧪  \e[1;34m%-30s\e[0m %s\n" "Dry Run Mode:" "$dry_run"
+    log "$(printf "🧪  %-30s %s" "Dry Run Mode:" "$dry_run")"
 
-    [[ "$backup_failed" == "true" ]] && printf "\n\e[1;31m⚠️  Backup verification failed. Please review the logs.\e[0m\n"
-    printf "===========================================================\n"
-    verbose_output "✅ All Done!"
+    [[ "$backup_failed" == "true" ]] && log "\n⚠️  Backup verification failed. Please review the logs."
+    log "==========================================================="
+    log "✅ All Done!"
 }
 
 # Kick off the script with all passed arguments
