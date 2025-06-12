@@ -322,7 +322,7 @@ zst_backup() {
     ( cd "$source_dir" &&
         tar --ignore-failed-read -cf - --transform "s|^|$base_dir_name/|" "${exclude[@]}" "${backup_source[@]}"
     ) | \
-    pv --size "$dir_size" --progress --timer --rate --eta --bytes --name BACKUP --force --width "$(($(tput cols)-10))" | \
+    pv --size "$dir_size" --progress --timer --rate --eta --bytes --name BACKUP --force --width "$(($(tput cols)-10))" 2>/dev/tty | \
     zstd -q --threads=0 -19 -o "$backup_path/$folder_type-plex_backup.zst"
 }
 
@@ -334,7 +334,7 @@ zst_backup() {
     ( cd "$source_dir" &&
         tar --ignore-failed-read -cf - --transform "s|^|$base_dir_name/|" "${exclude[@]}" "${backup_source[@]}"
     ) | \
-    pv --size "$dir_size" --progress --timer --rate --eta --bytes --name BACKUP --force --width "$(($(tput cols)-10))" | \
+    pv --size "$dir_size" --progress --timer --rate --eta --bytes --name BACKUP --force --width "$(($(tput cols)-10))" 2>/dev/tty | \
     7z a -si -t7z -m0=lzma2 -mx=3 -md=16m -mfb=32 -mmt=on -ms=off "$backup_path/$folder_type-plex_backup.7z" >/dev/null
 }
 
@@ -357,7 +357,7 @@ tar_backup() {
                 --transform "s|^|$base_dir_name/|" \
                 "${exclude[@]}" "${backup_source[@]}"
             ) | \
-            pv --size "$dir_size" --progress --timer --rate --eta --bytes --name BACKUP --force --width "$(($(tput cols) - 10))" > "$backup_path/$folder_type-plex_backup.$extension"
+            pv --size "$dir_size" --progress --timer --rate --eta --bytes --name BACKUP --force --width "$(($(tput cols) - 10))" 2>/dev/tty > "$backup_path/$folder_type-plex_backup.$extension"
         else
             verbose_output "📦 Creating archive..."
             ( cd "$source_dir" &&
@@ -672,7 +672,7 @@ run_restore() {
         else
             echo "📦 Extracting .tar archive..."
             if command -v pv >/dev/null; then
-                tar --strip-components=1 -xf - -C "$restore_target" < <(pv "$archive")
+                tar --strip-components=1 -xf - -C "$restore_target" < <(pv "$archive" 2>/dev/tty)
             else
                 tar -xf "$archive" -C "$restore_target"
             fi
