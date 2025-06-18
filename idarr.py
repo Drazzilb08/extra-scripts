@@ -21,7 +21,7 @@ import signal
 import atexit
 import sqlite3
 
-version = "1.4.0"
+version = "1.4.1"
 
 if sys.version_info < (3, 9):
     print("Python 3.9 or higher is required. Detected version: {}.{}.{}".format(*sys.version_info[:3]))
@@ -1663,10 +1663,8 @@ def normalize_cache_key(title: str) -> str:
 def save_pending_matches(pending_matches: dict, pending_file: str = PENDING_MATCHES_PATH):
     """
     Write pending matches dict to pending_matches.jsonc with standard header.
-    Only overwrites if there are unresolved matches.
+    Always overwrites the file: if empty, writes just the header and {}.
     """
-    if not pending_matches:
-        return
     try:
         with open(pending_file, "w", encoding="utf-8") as f:
             f.write('// List of pending matches in the form "Title (Year)": "add_tmdb_url_here",\n')
@@ -1675,8 +1673,11 @@ def save_pending_matches(pending_matches: dict, pending_file: str = PENDING_MATC
             )
             f.write("// Example:\n")
             f.write('// "Some Movie (2023)": "https://www.themoviedb.org/movie/12345"\n')
-            text = json.dumps(dict(sorted(pending_matches.items())), indent=2, ensure_ascii=False)
-            f.write(text + "\n")
+            if pending_matches:
+                text = json.dumps(dict(sorted(pending_matches.items())), indent=2, ensure_ascii=False)
+                f.write(text + "\n")
+            else:
+                f.write("{}\n")
     except Exception as e:
         log.warning(f"⚠️ Failed to save updated pending matches: {e}")
 
