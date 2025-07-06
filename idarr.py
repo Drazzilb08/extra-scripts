@@ -1243,7 +1243,7 @@ class IdarrConfig:
         cache_path: Path to cache file.
         no_cache: If True, disables cache.
         clear_cache: If True, clears cache at start.
-        remove_non_image_files: If True, deletes non-image files.
+        ignore_non_image_files: If True, ignores non-image files.
         limit: Limit number of items.
         filter: If True, filter items.
         type: Media type filter.
@@ -1272,7 +1272,7 @@ class IdarrConfig:
     cache_path: str = field(default_factory=lambda: os.path.join(SCRIPT_DIR, "cache", "idarr_cache.json"))
     no_cache: bool = False
     clear_cache: bool = False
-    remove_non_image_files: bool = False
+    ignore_non_image_files: bool = False
     limit: Optional[int] = None
     filter: bool = False
     type: Optional[str] = None
@@ -1962,7 +1962,7 @@ def scan_files_in_flat_folder(config: "IdarrConfig") -> list[MediaItem]:
         if file.startswith("."):
             continue
         ext = os.path.splitext(file)[-1].lower()
-        if ext not in IMAGE_EXTENSIONS and config.remove_non_image_files:
+        if ext not in IMAGE_EXTENSIONS and not config.ignore_non_image_files:
             full_path = os.path.join(config.source_dir, file)
             if config.source_dir:
                 if config.dry_run:
@@ -3127,7 +3127,7 @@ def print_rich_help() -> None:
     table.add_row("--quiet", "Suppress output except progress bars", "False")
     table.add_row("--debug", "Enable debug logging", "False")
     table.add_row("--limit N", "Maximum items to process", "0 (unlimited)")
-    table.add_row("--remove-non-image-files", "Remove non-image files", "False")
+    table.add_row("--ignore-non-image-files", "Ignore non-image files", "False")
     table.add_row("--pending-matches", "Only process pending matches list", "False")
     table.add_row("--ignore-file PATH", "Path to ignored_titles.jsonc", "logs/ignored_titles.jsonc")
     table.add_row(
@@ -3197,7 +3197,7 @@ def load_runtime_config(args: argparse.Namespace) -> IdarrConfig:
         if getattr(args, "limit", None) is not None
         else (int(os.environ.get("LIMIT")) if os.environ.get("LIMIT") else None)
     )
-    config.remove_non_image_files = getattr(args, "remove_non_image_files", False)
+    config.ignore_non_image_files = getattr(args, "ignore_non_image_files", False)
     config.ignore_file = (
         getattr(args, "ignore_file", None)
         or os.environ.get("IGNORE_FILE")
@@ -3312,7 +3312,7 @@ def print_settings(config: "IdarrConfig") -> None:
     settings.append(("General", "LOG_LEVEL", str(getattr(config, "log_level", "INFO"))))
     settings.append(("General", "LIMIT", str(getattr(config, "limit", None))))
     settings.append(
-        ("General", "REMOVE_NON_IMAGE_FILES", str(getattr(config, "remove_non_image_files", False)))
+        ("General", "IGNORE_NON_IMAGE_FILES", str(getattr(config, "ignore_non_image_files", False)))
     )
     settings.append(("General", "IGNORE_FILE", str(getattr(config, "ignore_file", ""))))
     settings.append(("General", "PENDING_MATCHES_PATH", str(PENDING_MATCHES_PATH)))
@@ -3423,9 +3423,9 @@ def parse_args() -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     general.add_argument(
-        "--remove-non-image-files",
+        "--ignore-non-image-files",
         action="store_true",
-        default=env_bool("REMOVE_NON_IMAGE_FILES", False),
+        default=env_bool("IGNORE_NON_IMAGE_FILES", False),
         help=argparse.SUPPRESS,
     )
     general.add_argument(
